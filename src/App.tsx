@@ -6,6 +6,7 @@ import { KeyboardDeck } from './components/KeyboardDeck';
 import { LayerMixer } from './components/LayerMixer';
 import { PerformanceControls } from './components/PerformanceControls';
 import { SceneMorphBar } from './components/SceneMorphBar';
+import { SET_LIST_STORAGE_KEY, SetListBar, SetListSong, loadSetList } from './components/SetListBar';
 import { TopBar } from './components/TopBar';
 import { useMidiInput } from './hooks/useMidiInput';
 import {
@@ -90,6 +91,10 @@ export default function App() {
   const [morphProgress, setMorphProgress] = useState(1);
   const [isMorphing, setIsMorphing] = useState(false);
   const morphAnimRef = useRef<MorphAnimation | null>(null);
+
+  // Set List
+  const [setList, setSetList] = useState<SetListSong[]>(loadSetList);
+  const [activeSongIndex, setActiveSongIndex] = useState<number | null>(null);
 
   // Performance Input State
   const [octaveShift, setOctaveShift] = useState(0);
@@ -552,6 +557,155 @@ export default function App() {
     [droneEnabled, droneKey, engine],
   );
 
+  // Set List: save / recall whole songs (scene mix + key + drone + chord settings)
+  const persistSetList = useCallback((next: SetListSong[]) => {
+    setSetList(next);
+    try {
+      localStorage.setItem(SET_LIST_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore quota errors
+    }
+  }, []);
+
+  const captureSong = useCallback(
+    (id: string, name: string): SetListSong => {
+      const sourceScene =
+        [...FACTORY_SCENES, ...customSlots].find((sc) => sc && sc.id === activeSceneId) ??
+        setList.find((sg) => sg.scene.id === activeSceneId)?.scene;
+      return {
+        id,
+        name,
+        scene: {
+          id,
+          name,
+          description: sourceScene?.description ?? 'Custom mix',
+          isFactory: false,
+          channels: {
+            feltPiano: channels.feltPiano.gain,
+            warmPad: channels.warmPad.gain,
+            highShimmer: channels.highShimmer.gain,
+            subBass: channels.subBass.gain,
+            keyDrone: channels.keyDrone.gain,
+          },
+          shaping: {
+            filterCutoff: shaping.filterCutoff,
+            reverbMix: shaping.reverbMix,
+            padAttack: shaping.padAttack,
+            padRelease: shaping.padRelease,
+          },
+        },
+        key: droneKey,
+        droneEnabled: true, // a song starts sounding (drone in its key) when you press Next
+        chordMode,
+        chordVoicing,
+        scaleMode,
+      };
+    },
+    [activeSceneId, customSlots, setList, channels, shaping, droneKey, chordMode, chordVoicing, scaleMode],
+  );
+
+  const handleSelectSong = useCallback(
+    async (index: number) => {
+      const song = setList[index];
+      if (!song) return;
+      setActiveSongIndex(index);
+      releaseOneClickChord();
+      setChordMode(song.chordMode);
+      setChordVoicing(song.chordVoicing);
+      setScaleMode(song.scaleMode);
+      await handleSelectScene(song.scene);
+      if (song.key !== droneKey) {
+        setDroneKey(song.key);
+        await engine.setDroneKey(song.key);
+      }
+      if (song.droneEnabled !== droneEnabled) {
+        setDroneEnabled(song.droneEnabled);
+        await engine.setDroneEnabled(song.droneEnabled);
+      }
+    },
+    [setList, releaseOneClickChord, handleSelectScene, droneKey, droneEnabled, engine],
+  );
+
+  const handleNextSong = useCallback(() => {
+    const next = activeSongIndex === null ? 0 : activeSongIndex + 1;
+    if (next < setList.length) void handleSelectSong(next);
+  }, [activeSongIndex, setList.length, handleSelectSong]);
+
+  const handlePrevSong = useCallback(() => {
+    if (activeSongIndex !== null && activeSongIndex > 0) void handleSelectSong(activeSongIndex - 1);
+  }, [activeSongIndex, handleSelectSong]);
+
+  const handleAddSong = useCallback(
+    (name: string) => {
+      const songName = name || `Song ${setList.length + 1}`;
+      const id = `song-${Date.now()}`;
+      persistSetList([...setList, captureSong(id, songName)]);
+      setActiveSongIndex(setList.length);
+    },
+    [setList, captureSong, persistSetList],
+  );
+
+  const handleUpdateSong = useCallback(
+    (index: number) => {
+      const old = setList[index];
+      if (!old) return;
+      const next = [...setList];
+      next[index] = captureSong(old.id, old.name);
+      persistSetList(next);
+    },
+    [setList, captureSong, persistSetList],
+  );
+
+  const handleToggleSongDrone = useCallback(
+    (index: number) => {
+      const old = setList[index];
+      if (!old) return;
+      const next = [...setList];
+      next[index] = { ...old, droneEnabled: !old.droneEnabled };
+      persistSetList(next);
+    },
+    [setList, persistSetList],
+  );
+
+  const handleRenameSong = useCallback(
+    (index: number, name: string) => {
+      const old = setList[index];
+      if (!old) return;
+      const next = [...setList];
+      next[index] = { ...old, name, scene: { ...old.scene, name } };
+      persistSetList(next);
+    },
+    [setList, persistSetList],
+  );
+
+  const handleMoveSong = useCallback(
+    (index: number, direction: -1 | 1) => {
+      const target = index + direction;
+      if (target < 0 || target >= setList.length) return;
+      const next = [...setList];
+      [next[index], next[target]] = [next[target], next[index]];
+      persistSetList(next);
+      setActiveSongIndex((cur) => {
+        if (cur === index) return target;
+        if (cur === target) return index;
+        return cur;
+      });
+    },
+    [setList, persistSetList],
+  );
+
+  const handleDeleteSong = useCallback(
+    (index: number) => {
+      persistSetList(setList.filter((_, i) => i !== index));
+      setActiveSongIndex((cur) => {
+        if (cur === null) return null;
+        if (cur === index) return null;
+        return cur > index ? cur - 1 : cur;
+      });
+    },
+    [setList, persistSetList],
+  );
+
   // Emergency Panic
   const handlePanic = useCallback(() => {
     activeChordTriggersRef.current.clear();
@@ -610,6 +764,21 @@ export default function App() {
 
       {/* Main Single-Screen Performance Console */}
       <main className="flex-1 min-h-0 flex flex-col gap-2.5 lg:gap-3 p-2.5 lg:p-3.5 max-w-[1600px] w-full mx-auto">
+        {/* Set List: recall scene + key + drone + chords for the next song in one tap */}
+        <SetListBar
+          songs={setList}
+          activeIndex={activeSongIndex}
+          onSelectSong={(i) => void handleSelectSong(i)}
+          onPrev={handlePrevSong}
+          onNext={handleNextSong}
+          onAddCurrent={handleAddSong}
+          onUpdateSong={handleUpdateSong}
+          onToggleSongDrone={handleToggleSongDrone}
+          onRenameSong={handleRenameSong}
+          onMoveSong={handleMoveSong}
+          onDeleteSong={handleDeleteSong}
+        />
+
         {/* Upper Deck: Scene Morph Presets + 12-Key Drone Grid */}
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-2.5 lg:gap-3 shrink-0">
           <div className="xl:col-span-7">
