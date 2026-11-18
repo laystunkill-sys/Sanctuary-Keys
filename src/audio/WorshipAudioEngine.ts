@@ -1,0 +1,1167 @@
+import {
+  ChannelId,
+  ChannelState,
+  INITIAL_CHANNELS,
+  INITIAL_SHAPING,
+  MUSICAL_KEYS,
+  MusicalKey,
+  ScenePreset,
+  ShapingParams,
+  midiToFreq,
+} from '../types/synth';
+
+interface ChannelBus {
+  input: GainNode;
+  faderGain: GainNode;
+  muteSoloGain: GainNode;
+  analyser: AnalyserNode;
+  dataArray: Float32Array<ArrayBuffer>;
+}
+
+interface ActiveVoice {
+  id: number;
+  midi: number;
+  startTime: number;
+  released: boolean;
+  stopTimeout?: number;
+  // Layer gain envelopes
+  pianoEnv: GainNode;
+  padEnv: GainNode;
+  shimmerEnv: GainNode;
+  subEnv: GainNode;
+  cleanup: () => void;
+}
+
+interface DroneBus {
+  busGain: GainNode;
+  stopNodes: () => void;
+}
+
+export interface VoiceTriggerOptions {
+  softSwell?: boolean;
+  delayOffsetSec?: number;
+}
+
+const MAX_POLY_VOICES = 24;
+const DRONE_CROSSFADE_SEC = 4.0;
+const SCENE_MORPH_SEC = 1.5;
+
+export class WorshipAudioEngine {
+  private ctx: AudioContext | null = null;
+  private isInitialized = false;
+
+  // 5-Channel Mixer Buses
+  private channels: Record<ChannelId, ChannelBus> | null = null;
+  private channelStates: Record<ChannelId, ChannelState> = structuredClone(INITIAL_CHANNELS);
+  private shaping: ShapingParams = { ...INITIAL_SHAPING };
+
+  // Master Effects Chain
+  private preMasterSum: GainNode | null = null;
+  private masterFilter: BiquadFilterNode | null = null;
+  private dryGain: GainNode | null = null;
+  private wetGain: GainNode | null = null;
+  private reverbSend: GainNode | null = null;
+  private convolver: ConvolverNode | null = null;
+  private shimmerDelayL: DelayNode | null = null;
+  private shimmerDelayR: DelayNode | null = null;
+  private shimmerFeedbackL: GainNode | null = null;
+  private shimmerFeedbackR: GainNode | null = null;
+  private shimmerHighOsc: OscillatorNode | null = null;
+  private masterSwellGain: GainNode | null = null;
+  private masterLimiter: DynamicsCompressorNode | null = null;
+
+  // Polyphonic Voices
+  private voiceCounter = 0;
+  private heldKeys = new Set<number>();
+  private sustainedNotes = new Set<number>();
+  private activeVoices = new Map<number, ActiveVoice[]>(); // midi -> voices
+  private sustainActive = false;
+
+  // Drone Engine (Dual alternating buses for 4s equal-power crossfades)
+  private droneEnabled = false;
+  private droneKey: MusicalKey = 'C';
+  private activeDroneBus: DroneBus | null = null;
+  private outgoingDroneCleanupTimer: number | null = null;
+  private crossfadeStartMs = 0;
+  private isCrossfading = false;
+
+  // Listeners
+  private onStateChange?: () => void;
+
+  public setOnStateChange(cb: () => void) {
+    this.onStateChange = cb;
+  }
+
+  public getContextState(): AudioContextState | 'uninitialized' {
+    return this.ctx ? this.ctx.state : 'uninitialized';
+  }
+
+  public isRunning(): boolean {
+    return Boolean(this.ctx && this.ctx.state === 'running');
+  }
+
+  public async initOrResume(): Promise<boolean> {
+    if (!this.ctx) {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.ctx = new AudioCtx({ latencyHint: 'interactive' });
+      this.buildGraph();
+      this.isInitialized = true;
+    }
+
+    if (this.ctx.state === 'suspended') {
+      await this.ctx.resume();
+    }
+
+    this.onStateChange?.();
+    return this.ctx.state === 'running';
+  }
+
+  private buildGraph() {
+    if (!this.ctx) return;
+    const ctx = this.ctx;
+
+    // 1. Master Summing & Effects Chain
+    this.preMasterSum = ctx.createGain();
+    this.preMasterSum.gain.value = 0.85;
+
+    this.masterFilter = ctx.createBiquadFilter();
+    this.masterFilter.type = 'lowpass';
+    this.masterFilter.frequency.value = this.shaping.filterCutoff;
+    this.masterFilter.Q.value = 1.05;
+
+    // Dry / Wet Cathedral + Shimmer Reverb Bus
+    this.dryGain = ctx.createGain();
+    this.wetGain = ctx.createGain();
+    this.applyReverbMixImmediate(this.shaping.reverbMix);
+
+    this.reverbSend = ctx.createGain();
+    this.reverbSend.gain.value = 0.85;
+
+    this.convolver = ctx.createConvolver();
+    this.convolver.buffer = this.generateCathedralIR(this.shaping.reverbDecay);
+
+    // Stereo Feedback Delay & Shimmer Tail feeding the Cathedral Convolver
+    const delayInputLP = ctx.createBiquadFilter();
+    delayInputLP.type = 'lowpass';
+    delayInputLP.frequency.value = 4600;
+
+    const delayInputHP = ctx.createBiquadFilter();
+    delayInputHP.type = 'highpass';
+    delayInputHP.frequency.value = 240;
+
+    this.shimmerDelayL = ctx.createDelay(2.0);
+    this.shimmerDelayL.delayTime.value = 0.31;
+    this.shimmerDelayR = ctx.createDelay(2.0);
+    this.shimmerDelayR.delayTime.value = 0.44;
+
+    // Subtle LFO modulation on delay times for lush chorus/shimmer spread
+    const modLfo = ctx.createOscillator();
+    modLfo.type = 'sine';
+    modLfo.frequency.value = 0.37;
+    const modDepthL = ctx.createGain();
+    modDepthL.gain.value = 0.0028;
+    const modDepthR = ctx.createGain();
+    modDepthR.gain.value = -0.0025;
+    modLfo.connect(modDepthL);
+    modLfo.connect(modDepthR);
+    modDepthL.connect(this.shimmerDelayL.delayTime);
+    modDepthR.connect(this.shimmerDelayR.delayTime);
+    modLfo.start();
+    this.shimmerHighOsc = modLfo;
+
+    this.shimmerFeedbackL = ctx.createGain();
+    this.shimmerFeedbackL.gain.value = 0.36;
+    this.shimmerFeedbackR = ctx.createGain();
+    this.shimmerFeedbackR.gain.value = 0.34;
+
+    const merger = ctx.createChannelMerger(2);
+    const wetToneFilter = ctx.createBiquadFilter();
+    wetToneFilter.type = 'lowpass';
+    wetToneFilter.frequency.value = 7200;
+
+    // Master Swell (Expression Pedal CC 11 / Slider)
+    this.masterSwellGain = ctx.createGain();
+    this.masterSwellGain.gain.value = this.shaping.masterSwell;
+
+    // Master Dynamics Limiter (Zero clipping guarantee)
+    this.masterLimiter = ctx.createDynamicsCompressor();
+    this.masterLimiter.threshold.value = -5.5;
+    this.masterLimiter.knee.value = 6.0;
+    this.masterLimiter.ratio.value = 12.0;
+    this.masterLimiter.attack.value = 0.003;
+    this.masterLimiter.release.value = 0.14;
+
+    // Wire Master Signal Chain
+    this.preMasterSum.connect(this.masterFilter);
+
+    // Dry path
+    this.masterFilter.connect(this.dryGain);
+    this.dryGain.connect(this.masterSwellGain);
+
+    // Wet path: Filter -> Reverb Send -> Convolver + Cross-Feedback Delay Tail -> Wet Gain
+    this.masterFilter.connect(this.reverbSend);
+    this.reverbSend.connect(this.convolver);
+
+    // Cross-feedback stereo delay loop into Convolver
+    this.reverbSend.connect(delayInputHP);
+    delayInputHP.connect(delayInputLP);
+    delayInputLP.connect(this.shimmerDelayL);
+    delayInputLP.connect(this.shimmerDelayR);
+
+    this.shimmerDelayL.connect(this.shimmerFeedbackL);
+    this.shimmerFeedbackL.connect(this.shimmerDelayR);
+    this.shimmerDelayR.connect(this.shimmerFeedbackR);
+    this.shimmerFeedbackR.connect(this.shimmerDelayL);
+
+    this.shimmerDelayL.connect(merger, 0, 0);
+    this.shimmerDelayR.connect(merger, 0, 1);
+    merger.connect(this.convolver);
+
+    // Subtle octave-up harmonic shimmer exciter into the cathedral reverb tail
+    const shimmerPreHP = ctx.createBiquadFilter();
+    shimmerPreHP.type = 'highpass';
+    shimmerPreHP.frequency.value = 420;
+
+    const shimmerShaper = ctx.createWaveShaper();
+    const curveLen = 512;
+    const shimmerCurve = new Float32Array(curveLen);
+    for (let i = 0; i < curveLen; i++) {
+      const x = (i * 2) / (curveLen - 1) - 1;
+      // Even-harmonic quadratic curve creates clean +1 octave (2f) shimmer overtones
+      shimmerCurve[i] = x * x * 0.55;
+    }
+    shimmerShaper.curve = shimmerCurve;
+
+    const shimmerPostHP = ctx.createBiquadFilter();
+    shimmerPostHP.type = 'highpass';
+    shimmerPostHP.frequency.value = 650;
+    const shimmerPostLP = ctx.createBiquadFilter();
+    shimmerPostLP.type = 'lowpass';
+    shimmerPostLP.frequency.value = 6200;
+
+    const shimmerTailGain = ctx.createGain();
+    shimmerTailGain.gain.value = 0.24;
+
+    merger.connect(shimmerPreHP);
+    shimmerPreHP.connect(shimmerShaper);
+    shimmerShaper.connect(shimmerPostHP);
+    shimmerPostHP.connect(shimmerPostLP);
+    shimmerPostLP.connect(shimmerTailGain);
+    shimmerTailGain.connect(this.convolver);
+
+    this.convolver.connect(wetToneFilter);
+    wetToneFilter.connect(this.wetGain);
+    this.wetGain.connect(this.masterSwellGain);
+
+    this.masterSwellGain.connect(this.masterLimiter);
+    this.masterLimiter.connect(ctx.destination);
+
+    // 2. Build 5-Channel Mixer Buses
+    const ids: ChannelId[] = ['feltPiano', 'warmPad', 'highShimmer', 'subBass', 'keyDrone'];
+    const buses = {} as Record<ChannelId, ChannelBus>;
+
+    for (const id of ids) {
+      const input = ctx.createGain();
+      input.gain.value = 1.0;
+
+      const faderGain = ctx.createGain();
+      faderGain.gain.value = this.channelStates[id].gain;
+
+      const muteSoloGain = ctx.createGain();
+      muteSoloGain.gain.value = 1.0;
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.72;
+
+      input.connect(faderGain);
+      faderGain.connect(muteSoloGain);
+      muteSoloGain.connect(analyser);
+      analyser.connect(this.preMasterSum);
+
+      buses[id] = {
+        input,
+        faderGain,
+        muteSoloGain,
+        analyser,
+        dataArray: new Float32Array(new ArrayBuffer(analyser.fftSize * 4)),
+      };
+    }
+
+    this.channels = buses;
+    this.recomputeMuteSolo();
+  }
+
+  private generateCathedralIR(decaySeconds: number): AudioBuffer {
+    const ctx = this.ctx!;
+    const sampleRate = ctx.sampleRate;
+    const length = Math.max(sampleRate * 1.5, Math.floor(sampleRate * decaySeconds));
+    const buffer = ctx.createBuffer(2, length, sampleRate);
+    const left = buffer.getChannelData(0);
+    const right = buffer.getChannelData(1);
+
+    // Early reflections + smooth exponential cathedral tail with progressive high-frequency damping
+    let lpL = 0;
+    let lpR = 0;
+    const damp = 0.35;
+
+    for (let i = 0; i < length; i++) {
+      const t = i / sampleRate;
+      const env = Math.pow(1 - i / length, 2.4) * Math.exp((-3.2 * t) / decaySeconds);
+      // Slight fade-in on first 18ms so reverb blooms smoothly instead of clicking
+      const preBloom = t < 0.018 ? t / 0.018 : 1;
+
+      const whiteL = Math.random() * 2 - 1;
+      const whiteR = Math.random() * 2 - 1;
+
+      lpL = lpL + damp * (whiteL - lpL);
+      lpR = lpR + damp * (whiteR - lpR);
+
+      // Subtle shimmer harmonic sparkle in upper tail
+      const shimmerBoost = Math.sin(t * 2.1) * 0.04 + 1;
+      left[i] = lpL * env * preBloom * 0.55 * shimmerBoost;
+      right[i] = lpR * env * preBloom * 0.55 * shimmerBoost;
+    }
+
+    // Add a few discrete cathedral early reflection taps
+    const taps = [0.023, 0.041, 0.067, 0.098, 0.135];
+    taps.forEach((tapSec, idx) => {
+      const idxSample = Math.floor(tapSec * sampleRate);
+      if (idxSample < length) {
+        const amp = 0.14 / (idx + 1);
+        left[idxSample] += amp * (idx % 2 === 0 ? 1 : 0.7);
+        right[idxSample] += amp * (idx % 2 === 1 ? 1 : 0.7);
+      }
+    });
+
+    return buffer;
+  }
+
+  // --- Mixer & Effects Parameter Setters ---
+
+  public setChannelGain(id: ChannelId, gain: number) {
+    const clamped = Math.max(0, Math.min(1, gain));
+    this.channelStates[id].gain = clamped;
+    if (this.channels && this.ctx) {
+      const now = this.ctx.currentTime;
+      const param = this.channels[id].faderGain.gain;
+      param.cancelScheduledValues(now);
+      param.setTargetAtTime(clamped, now, 0.015);
+    }
+  }
+
+  public setChannelMute(id: ChannelId, muted: boolean) {
+    this.channelStates[id].muted = muted;
+    this.recomputeMuteSolo();
+  }
+
+  public setChannelSolo(id: ChannelId, soloed: boolean) {
+    this.channelStates[id].soloed = soloed;
+    this.recomputeMuteSolo();
+  }
+
+  private recomputeMuteSolo() {
+    if (!this.channels || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    const anySoloed = Object.values(this.channelStates).some((c) => c.soloed);
+
+    (Object.keys(this.channelStates) as ChannelId[]).forEach((id) => {
+      const ch = this.channelStates[id];
+      const audible = anySoloed ? ch.soloed && !ch.muted : !ch.muted;
+      const target = audible ? 1.0 : 0.0;
+      const param = this.channels![id].muteSoloGain.gain;
+      param.cancelScheduledValues(now);
+      param.setTargetAtTime(target, now, 0.02);
+    });
+  }
+
+  public setFilterCutoff(hz: number) {
+    const clamped = Math.max(120, Math.min(12000, hz));
+    this.shaping.filterCutoff = clamped;
+    if (this.masterFilter && this.ctx) {
+      const now = this.ctx.currentTime;
+      this.masterFilter.frequency.cancelScheduledValues(now);
+      this.masterFilter.frequency.setTargetAtTime(clamped, now, 0.02);
+    }
+  }
+
+  public setMasterSwell(val: number) {
+    const clamped = Math.max(0, Math.min(1, val));
+    this.shaping.masterSwell = clamped;
+    if (this.masterSwellGain && this.ctx) {
+      const now = this.ctx.currentTime;
+      this.masterSwellGain.gain.cancelScheduledValues(now);
+      this.masterSwellGain.gain.setTargetAtTime(clamped, now, 0.02);
+    }
+  }
+
+  private applyReverbMixImmediate(mix: number) {
+    if (!this.dryGain || !this.wetGain) return;
+    const dry = Math.cos(mix * Math.PI * 0.5);
+    const wet = Math.sin(mix * Math.PI * 0.5) * 1.15;
+    this.dryGain.gain.value = dry;
+    this.wetGain.gain.value = wet;
+  }
+
+  public setReverbMix(mix: number) {
+    const clamped = Math.max(0, Math.min(1, mix));
+    this.shaping.reverbMix = clamped;
+    if (this.dryGain && this.wetGain && this.ctx) {
+      const now = this.ctx.currentTime;
+      const dry = Math.cos(clamped * Math.PI * 0.5);
+      const wet = Math.sin(clamped * Math.PI * 0.5) * 1.15;
+      this.dryGain.gain.cancelScheduledValues(now);
+      this.wetGain.gain.cancelScheduledValues(now);
+      this.dryGain.gain.setTargetAtTime(dry, now, 0.02);
+      this.wetGain.gain.setTargetAtTime(wet, now, 0.02);
+    }
+  }
+
+  public setReverbDecay(decaySec: number) {
+    const clamped = Math.max(2, Math.min(10, decaySec));
+    this.shaping.reverbDecay = clamped;
+    if (this.convolver && this.ctx) {
+      this.convolver.buffer = this.generateCathedralIR(clamped);
+    }
+  }
+
+  public setPadAttack(sec: number) {
+    this.shaping.padAttack = Math.max(0.5, Math.min(2.0, sec));
+  }
+
+  public setPadRelease(sec: number) {
+    this.shaping.padRelease = Math.max(1.5, Math.min(5.0, sec));
+  }
+
+  // Smooth 1.5s Scene Morph using linearRampToValueAtTime
+  public morphToScene(scene: ScenePreset) {
+    (Object.keys(scene.channels) as ChannelId[]).forEach((id) => {
+      this.channelStates[id].gain = scene.channels[id];
+    });
+    this.shaping.filterCutoff = scene.shaping.filterCutoff;
+    this.shaping.reverbMix = scene.shaping.reverbMix;
+    this.shaping.padAttack = scene.shaping.padAttack;
+    this.shaping.padRelease = scene.shaping.padRelease;
+
+    if (!this.ctx || !this.channels || !this.masterFilter || !this.dryGain || !this.wetGain) {
+      return;
+    }
+
+    const now = this.ctx.currentTime;
+    const end = now + SCENE_MORPH_SEC;
+
+    (Object.keys(scene.channels) as ChannelId[]).forEach((id) => {
+      const param = this.channels![id].faderGain.gain;
+      const currentVal = param.value;
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(currentVal, now);
+      param.linearRampToValueAtTime(scene.channels[id], end);
+    });
+
+    const filterParam = this.masterFilter.frequency;
+    const curFilter = filterParam.value;
+    filterParam.cancelScheduledValues(now);
+    filterParam.setValueAtTime(curFilter, now);
+    filterParam.linearRampToValueAtTime(scene.shaping.filterCutoff, end);
+
+    const mix = scene.shaping.reverbMix;
+    const targetDry = Math.cos(mix * Math.PI * 0.5);
+    const targetWet = Math.sin(mix * Math.PI * 0.5) * 1.15;
+
+    const curDry = this.dryGain.gain.value;
+    this.dryGain.gain.cancelScheduledValues(now);
+    this.dryGain.gain.setValueAtTime(curDry, now);
+    this.dryGain.gain.linearRampToValueAtTime(targetDry, end);
+
+    const curWet = this.wetGain.gain.value;
+    this.wetGain.gain.cancelScheduledValues(now);
+    this.wetGain.gain.setValueAtTime(curWet, now);
+    this.wetGain.gain.linearRampToValueAtTime(targetWet, end);
+  }
+
+  // --- Channel Live Level Metering ---
+
+  public getChannelLevels(): Record<ChannelId, number> {
+    const out: Record<ChannelId, number> = {
+      feltPiano: 0,
+      warmPad: 0,
+      highShimmer: 0,
+      subBass: 0,
+      keyDrone: 0,
+    };
+    if (!this.channels || !this.isRunning()) return out;
+
+    (Object.keys(this.channels) as ChannelId[]).forEach((id) => {
+      const bus = this.channels![id];
+      bus.analyser.getFloatTimeDomainData(bus.dataArray);
+      let sum = 0;
+      for (let i = 0; i < bus.dataArray.length; i++) {
+        const s = bus.dataArray[i];
+        sum += s * s;
+      }
+      const rms = Math.sqrt(sum / bus.dataArray.length);
+      // Musical meter curve (~ -42dB to 0dB mapped cleanly 0..1)
+      const normalized = Math.min(1, Math.pow(rms * 3.8, 0.65));
+      out[id] = normalized;
+    });
+
+    return out;
+  }
+
+  // --- Polyphonic 4-Layer Voice Engine ---
+
+  public async noteOn(midi: number, velocity = 0.85, options?: VoiceTriggerOptions) {
+    if (!this.isInitialized || this.ctx?.state === 'suspended') {
+      await this.initOrResume();
+    }
+    if (!this.ctx || !this.channels) return;
+
+    this.heldKeys.add(midi);
+    this.sustainedNotes.delete(midi);
+
+    // Release any existing sounding voice of the same pitch gently to prevent buildup
+    const existing = this.activeVoices.get(midi);
+    if (existing && existing.length > 0) {
+      existing.forEach((v) => {
+        if (!v.released) {
+          this.releaseVoice(v, options?.softSwell ? 0.35 : 0.08);
+        }
+      });
+    }
+
+    // Voice stealing if polyphony exceeds cap
+    const allVoices: ActiveVoice[] = [];
+    this.activeVoices.forEach((list) => allVoices.push(...list));
+    if (allVoices.length >= MAX_POLY_VOICES) {
+      allVoices.sort((a, b) => a.startTime - b.startTime);
+      const oldest = allVoices[0];
+      if (oldest) {
+        this.releaseVoice(oldest, 0.04);
+      }
+    }
+
+    const voice = this.spawnPolyVoice(midi, Math.max(0.1, Math.min(1, velocity)), options);
+    const list = this.activeVoices.get(midi) ?? [];
+    list.push(voice);
+    this.activeVoices.set(midi, list);
+    this.onStateChange?.();
+  }
+
+  public noteOff(midi: number) {
+    this.heldKeys.delete(midi);
+    if (this.sustainActive) {
+      this.sustainedNotes.add(midi);
+      this.onStateChange?.();
+      return;
+    }
+
+    const list = this.activeVoices.get(midi);
+    if (list) {
+      list.forEach((v) => {
+        if (!v.released) {
+          this.releaseVoice(v);
+        }
+      });
+    }
+    this.onStateChange?.();
+  }
+
+  public releasePadNote(midi: number) {
+    this.heldKeys.delete(midi);
+    this.sustainedNotes.delete(midi);
+    const list = this.activeVoices.get(midi);
+    if (list) {
+      list.forEach((v) => {
+        if (!v.released) {
+          this.releaseVoice(v);
+        }
+      });
+    }
+    this.onStateChange?.();
+  }
+
+  public setSustain(active: boolean) {
+    this.sustainActive = active;
+    if (!active) {
+      const toRelease = Array.from(this.sustainedNotes);
+      this.sustainedNotes.clear();
+      toRelease.forEach((midi) => {
+        if (!this.heldKeys.has(midi)) {
+          const list = this.activeVoices.get(midi);
+          if (list) {
+            list.forEach((v) => {
+              if (!v.released) this.releaseVoice(v);
+            });
+          }
+        }
+      });
+    }
+    this.onStateChange?.();
+  }
+
+  public panic() {
+    this.heldKeys.clear();
+    this.sustainedNotes.clear();
+    this.sustainActive = false;
+
+    const all: ActiveVoice[] = [];
+    this.activeVoices.forEach((list) => all.push(...list));
+    all.forEach((v) => this.releaseVoice(v, 0.02));
+    this.activeVoices.clear();
+    this.onStateChange?.();
+  }
+
+  public getActiveNotes(): Set<number> {
+    const set = new Set<number>(this.heldKeys);
+    this.sustainedNotes.forEach((n) => set.add(n));
+    return set;
+  }
+
+  public isNoteSustained(midi: number): boolean {
+    return this.sustainedNotes.has(midi) && !this.heldKeys.has(midi);
+  }
+
+  public getActiveVoiceCount(): number {
+    let count = 0;
+    this.activeVoices.forEach((list) => {
+      count += list.length;
+    });
+    return count;
+  }
+
+  private buildRisingCurve(target: number, power: number): Float32Array {
+    const steps = 64;
+    const curve = new Float32Array(steps);
+    for (let i = 0; i < steps; i++) {
+      const t = i / (steps - 1);
+      curve[i] = target * Math.pow(t, power);
+    }
+    return curve;
+  }
+
+  private spawnPolyVoice(
+    midi: number,
+    velocity: number,
+    options?: VoiceTriggerOptions,
+  ): ActiveVoice {
+    const ctx = this.ctx!;
+    const channels = this.channels!;
+    const startAt = ctx.currentTime + (options?.delayOffsetSec ?? 0);
+    const freq = midiToFreq(midi);
+    const id = ++this.voiceCounter;
+    const isSoftSwell = Boolean(options?.softSwell);
+    const swellDuration = Math.max(1.5, this.shaping.padAttack * 1.45);
+
+    const nodesToStop: OscillatorNode[] = [];
+    const nodesToDisconnect: AudioNode[] = [];
+
+    // =========================================================================
+    // LAYER 1: FELT ACOUSTIC PIANO
+    // Triangle + Sine oscillators with short pluck filter envelope & warm roll-off
+    // =========================================================================
+    const pianoTri = ctx.createOscillator();
+    pianoTri.type = 'triangle';
+    pianoTri.frequency.value = freq;
+
+    const pianoSine = ctx.createOscillator();
+    pianoSine.type = 'sine';
+    pianoSine.frequency.value = freq;
+
+    const pianoHarmonic = ctx.createOscillator();
+    pianoHarmonic.type = 'sine';
+    pianoHarmonic.frequency.value = freq * 2;
+
+    const pianoTriGain = ctx.createGain();
+    pianoTriGain.gain.value = 0.52;
+    const pianoSineGain = ctx.createGain();
+    pianoSineGain.gain.value = 0.36;
+    const pianoHarmGain = ctx.createGain();
+    pianoHarmGain.gain.value = (isSoftSwell ? 0.045 : 0.11) * velocity;
+
+    const pianoFilter = ctx.createBiquadFilter();
+    pianoFilter.type = 'lowpass';
+    pianoFilter.Q.value = 0.65;
+    const warmRest = Math.max(580, Math.min(2400, freq * 2.2));
+    if (isSoftSwell) {
+      // Gentle dark-to-warm filter bloom with no sudden hammer snap
+      pianoFilter.frequency.setValueAtTime(Math.max(320, warmRest * 0.55), startAt);
+      pianoFilter.frequency.exponentialRampToValueAtTime(warmRest, startAt + 0.9);
+    } else {
+      const brightPeak = Math.min(9000, freq * (4.2 + velocity * 3.8));
+      pianoFilter.frequency.setValueAtTime(brightPeak, startAt);
+      pianoFilter.frequency.exponentialRampToValueAtTime(warmRest, startAt + 0.19);
+    }
+
+    const pianoEnv = ctx.createGain();
+    if (isSoftSwell) {
+      const softPianoTarget = 0.18 * (0.45 + velocity * 0.55);
+      pianoEnv.gain.setValueAtTime(0, startAt);
+      pianoEnv.gain.setValueCurveAtTime(
+        this.buildRisingCurve(softPianoTarget, 2.2),
+        startAt,
+        Math.max(0.85, swellDuration * 0.65),
+      );
+    } else {
+      const pianoPeak = 0.42 * (0.45 + velocity * 0.55);
+      const decayTime = Math.max(1.8, 4.6 - (midi - 36) * 0.045);
+      pianoEnv.gain.setValueAtTime(0.0001, startAt);
+      pianoEnv.gain.linearRampToValueAtTime(pianoPeak, startAt + 0.008);
+      pianoEnv.gain.exponentialRampToValueAtTime(pianoPeak * 0.18, startAt + decayTime);
+    }
+
+    pianoTri.connect(pianoTriGain);
+    pianoSine.connect(pianoSineGain);
+    pianoHarmonic.connect(pianoHarmGain);
+    pianoTriGain.connect(pianoFilter);
+    pianoSineGain.connect(pianoFilter);
+    pianoHarmGain.connect(pianoFilter);
+    pianoFilter.connect(pianoEnv);
+    pianoEnv.connect(channels.feltPiano.input);
+
+    pianoTri.start(startAt);
+    pianoSine.start(startAt);
+    pianoHarmonic.start(startAt);
+    nodesToStop.push(pianoTri, pianoSine, pianoHarmonic);
+    nodesToDisconnect.push(pianoTriGain, pianoSineGain, pianoHarmGain, pianoFilter, pianoEnv);
+
+    // =========================================================================
+    // LAYER 2: WARM ANALOG PAD
+    // Stereo-detuned Sawtooth + Triangle oscillators with slow attack & release
+    // =========================================================================
+    const padSawL = ctx.createOscillator();
+    padSawL.type = 'sawtooth';
+    padSawL.frequency.value = freq;
+    padSawL.detune.value = -9;
+
+    const padSawR = ctx.createOscillator();
+    padSawR.type = 'sawtooth';
+    padSawR.frequency.value = freq;
+    padSawR.detune.value = 9;
+
+    const padTri = ctx.createOscillator();
+    padTri.type = 'triangle';
+    padTri.frequency.value = freq;
+    padTri.detune.value = 2;
+
+    const panL = ctx.createStereoPanner();
+    panL.pan.value = -0.58;
+    const panR = ctx.createStereoPanner();
+    panR.pan.value = 0.58;
+
+    const padSawGain = ctx.createGain();
+    padSawGain.gain.value = 0.24;
+    const padTriGain = ctx.createGain();
+    padTriGain.gain.value = 0.34;
+
+    const padFilter = ctx.createBiquadFilter();
+    padFilter.type = 'lowpass';
+    const padTargetFreq = Math.min(3400, Math.max(950, freq * 3.2));
+    padFilter.Q.value = 0.8;
+    if (isSoftSwell) {
+      padFilter.frequency.setValueAtTime(340, startAt);
+      padFilter.frequency.exponentialRampToValueAtTime(padTargetFreq, startAt + swellDuration);
+    } else {
+      padFilter.frequency.value = padTargetFreq;
+    }
+
+    const padEnv = ctx.createGain();
+    const padTarget = 0.28 * (0.55 + velocity * 0.45);
+    if (isSoftSwell) {
+      padEnv.gain.setValueAtTime(0, startAt);
+      padEnv.gain.setValueCurveAtTime(this.buildRisingCurve(padTarget, 2.4), startAt, swellDuration);
+    } else {
+      padEnv.gain.setValueAtTime(0.0001, startAt);
+      padEnv.gain.linearRampToValueAtTime(padTarget, startAt + this.shaping.padAttack);
+    }
+
+    padSawL.connect(panL);
+    padSawR.connect(panR);
+    panL.connect(padSawGain);
+    panR.connect(padSawGain);
+    padTri.connect(padTriGain);
+    padSawGain.connect(padFilter);
+    padTriGain.connect(padFilter);
+    padFilter.connect(padEnv);
+    padEnv.connect(channels.warmPad.input);
+
+    padSawL.start(startAt);
+    padSawR.start(startAt);
+    padTri.start(startAt);
+    nodesToStop.push(padSawL, padSawR, padTri);
+    nodesToDisconnect.push(panL, panR, padSawGain, padTriGain, padFilter, padEnv);
+
+    // =========================================================================
+    // LAYER 3: HIGH SHIMMER LAYER
+    // Octave-up (+12 semitones) ethereal sine/bell with subtle LFO vibrato
+    // =========================================================================
+    const shimmerFreq = midiToFreq(midi + 12);
+    const shimmerOsc = ctx.createOscillator();
+    shimmerOsc.type = 'sine';
+    shimmerOsc.frequency.value = shimmerFreq;
+
+    const shimmerBell = ctx.createOscillator();
+    shimmerBell.type = 'sine';
+    shimmerBell.frequency.value = shimmerFreq * 2;
+
+    const shimmerLfo = ctx.createOscillator();
+    shimmerLfo.type = 'sine';
+    shimmerLfo.frequency.value = 4.3;
+    const shimmerLfoGain = ctx.createGain();
+    shimmerLfoGain.gain.value = 7.5; // +/- 7.5 cents gentle vibrato
+
+    shimmerLfo.connect(shimmerLfoGain);
+    shimmerLfoGain.connect(shimmerOsc.detune);
+    shimmerLfoGain.connect(shimmerBell.detune);
+
+    const shimmerOscGain = ctx.createGain();
+    shimmerOscGain.gain.value = 0.24;
+    const shimmerBellGain = ctx.createGain();
+    shimmerBellGain.gain.value = 0.07;
+
+    const shimmerEnv = ctx.createGain();
+    const shimmerAttack = isSoftSwell
+      ? swellDuration * 1.15
+      : Math.max(0.35, this.shaping.padAttack * 0.85);
+    const shimmerTarget = 0.26 * (0.5 + velocity * 0.5);
+    if (isSoftSwell) {
+      shimmerEnv.gain.setValueAtTime(0, startAt);
+      shimmerEnv.gain.setValueCurveAtTime(
+        this.buildRisingCurve(shimmerTarget, 2.7),
+        startAt,
+        shimmerAttack,
+      );
+    } else {
+      shimmerEnv.gain.setValueAtTime(0.0001, startAt);
+      shimmerEnv.gain.linearRampToValueAtTime(shimmerTarget, startAt + shimmerAttack);
+    }
+
+    shimmerOsc.connect(shimmerOscGain);
+    shimmerBell.connect(shimmerBellGain);
+    shimmerOscGain.connect(shimmerEnv);
+    shimmerBellGain.connect(shimmerEnv);
+    shimmerEnv.connect(channels.highShimmer.input);
+
+    shimmerOsc.start(startAt);
+    shimmerBell.start(startAt);
+    shimmerLfo.start(startAt);
+    nodesToStop.push(shimmerOsc, shimmerBell, shimmerLfo);
+    nodesToDisconnect.push(shimmerLfoGain, shimmerOscGain, shimmerBellGain, shimmerEnv);
+
+    // =========================================================================
+    // LAYER 4: SUB-BASS LAYER
+    // Clean sine sub-octave (-12 semitones), gently rolled off in upper treble
+    // =========================================================================
+    const subOsc = ctx.createOscillator();
+    subOsc.type = 'sine';
+    subOsc.frequency.value = midiToFreq(midi - 12);
+
+    // Keep sub-bass authoritative in lower/mid registers without piercing high chords
+    const registerScale = midi <= 60 ? 1.0 : Math.max(0.18, 1 - (midi - 60) * 0.045);
+    const subEnv = ctx.createGain();
+    const subTarget = 0.34 * registerScale * (0.5 + velocity * 0.5);
+    if (isSoftSwell) {
+      subEnv.gain.setValueAtTime(0, startAt);
+      subEnv.gain.setValueCurveAtTime(
+        this.buildRisingCurve(subTarget * 0.8, 2.0),
+        startAt,
+        Math.max(0.9, swellDuration * 0.7),
+      );
+    } else {
+      subEnv.gain.setValueAtTime(0.0001, startAt);
+      subEnv.gain.linearRampToValueAtTime(subTarget, startAt + 0.035);
+    }
+
+    subOsc.connect(subEnv);
+    subEnv.connect(channels.subBass.input);
+    subOsc.start(startAt);
+    nodesToStop.push(subOsc);
+    nodesToDisconnect.push(subEnv);
+
+    const cleanup = () => {
+      nodesToStop.forEach((osc) => {
+        try {
+          osc.stop();
+          osc.disconnect();
+        } catch {
+          // Ignore already stopped oscillators
+        }
+      });
+      nodesToDisconnect.forEach((n) => {
+        try {
+          n.disconnect();
+        } catch {
+          // Ignore
+        }
+      });
+
+      const list = this.activeVoices.get(midi);
+      if (list) {
+        const filtered = list.filter((v) => v.id !== id);
+        if (filtered.length === 0) {
+          this.activeVoices.delete(midi);
+        } else {
+          this.activeVoices.set(midi, filtered);
+        }
+      }
+    };
+
+    return {
+      id,
+      midi,
+      startTime: startAt,
+      released: false,
+      pianoEnv,
+      padEnv,
+      shimmerEnv,
+      subEnv,
+      cleanup,
+    };
+  }
+
+  private releaseVoice(voice: ActiveVoice, overrideReleaseSec?: number) {
+    if (!this.ctx || voice.released) return;
+    voice.released = true;
+    const now = this.ctx.currentTime;
+
+    const pianoRel = overrideReleaseSec ?? 0.38;
+    const padRel = overrideReleaseSec ?? this.shaping.padRelease;
+    const shimmerRel = overrideReleaseSec ?? Math.max(1.8, this.shaping.padRelease * 1.15);
+    const subRel = overrideReleaseSec ?? 0.45;
+    const maxRel = Math.max(pianoRel, padRel, shimmerRel, subRel);
+
+    const rampOut = (gainNode: GainNode, duration: number) => {
+      const param = gainNode.gain;
+      const val = Math.max(0.0001, param.value);
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(val, now);
+      param.exponentialRampToValueAtTime(0.0001, now + duration);
+    };
+
+    rampOut(voice.pianoEnv, pianoRel);
+    rampOut(voice.padEnv, padRel);
+    rampOut(voice.shimmerEnv, shimmerRel);
+    rampOut(voice.subEnv, subRel);
+
+    voice.stopTimeout = window.setTimeout(() => {
+      voice.cleanup();
+      this.onStateChange?.();
+    }, (maxRel + 0.08) * 1000);
+  }
+
+  // --- Independent Continuous Key Drone Engine (Root + 5th across 2 octaves, no 3rd) ---
+
+  public async setDroneEnabled(enabled: boolean) {
+    if (enabled && (!this.isInitialized || this.ctx?.state === 'suspended')) {
+      await this.initOrResume();
+    }
+    this.droneEnabled = enabled;
+    if (!this.ctx || !this.channels) return;
+
+    if (enabled) {
+      this.triggerDroneKeyCrossfade(this.droneKey, 1.8);
+    } else if (this.activeDroneBus) {
+      const outgoing = this.activeDroneBus;
+      this.activeDroneBus = null;
+      const now = this.ctx.currentTime;
+      const cur = outgoing.busGain.gain.value;
+      outgoing.busGain.gain.cancelScheduledValues(now);
+      outgoing.busGain.gain.setValueAtTime(cur, now);
+      outgoing.busGain.gain.linearRampToValueAtTime(0, now + 1.2);
+      if (this.outgoingDroneCleanupTimer) clearTimeout(this.outgoingDroneCleanupTimer);
+      this.outgoingDroneCleanupTimer = window.setTimeout(() => {
+        outgoing.stopNodes();
+      }, 1300);
+      this.isCrossfading = false;
+    }
+    this.onStateChange?.();
+  }
+
+  public async setDroneKey(key: MusicalKey) {
+    this.droneKey = key;
+    if (!this.droneEnabled) {
+      this.onStateChange?.();
+      return;
+    }
+    if (!this.isInitialized || this.ctx?.state === 'suspended') {
+      await this.initOrResume();
+    }
+    this.triggerDroneKeyCrossfade(key, DRONE_CROSSFADE_SEC);
+  }
+
+  public getCrossfadeProgress(): { isCrossfading: boolean; progress: number } {
+    if (!this.isCrossfading) return { isCrossfading: false, progress: 1 };
+    const elapsed = (performance.now() - this.crossfadeStartMs) / 1000;
+    const progress = Math.min(1, elapsed / DRONE_CROSSFADE_SEC);
+    if (progress >= 1) {
+      this.isCrossfading = false;
+    }
+    return { isCrossfading: this.isCrossfading, progress };
+  }
+
+  private triggerDroneKeyCrossfade(key: MusicalKey, fadeSec: number) {
+    if (!this.ctx || !this.channels) return;
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+
+    const incoming = this.createDroneBusForKey(key);
+    const outgoing = this.activeDroneBus;
+    this.activeDroneBus = incoming;
+
+    // Equal-power fade-in curve (sin(t * pi/2))
+    const steps = 64;
+    const fadeInCurve = new Float32Array(steps);
+    const fadeOutCurve = new Float32Array(steps);
+    for (let i = 0; i < steps; i++) {
+      const t = i / (steps - 1);
+      fadeInCurve[i] = Math.sin(t * Math.PI * 0.5);
+      fadeOutCurve[i] = Math.cos(t * Math.PI * 0.5);
+    }
+
+    incoming.busGain.gain.cancelScheduledValues(now);
+    incoming.busGain.gain.setValueAtTime(0, now);
+    incoming.busGain.gain.setValueCurveAtTime(fadeInCurve, now, fadeSec);
+
+    if (outgoing) {
+      const startLevel = Math.max(0.001, outgoing.busGain.gain.value);
+      const scaledOut = new Float32Array(steps);
+      for (let i = 0; i < steps; i++) {
+        scaledOut[i] = fadeOutCurve[i] * startLevel;
+      }
+      outgoing.busGain.gain.cancelScheduledValues(now);
+      outgoing.busGain.gain.setValueAtTime(startLevel, now);
+      outgoing.busGain.gain.setValueCurveAtTime(scaledOut, now, fadeSec);
+
+      if (this.outgoingDroneCleanupTimer) clearTimeout(this.outgoingDroneCleanupTimer);
+      this.outgoingDroneCleanupTimer = window.setTimeout(() => {
+        outgoing.stopNodes();
+      }, (fadeSec + 0.15) * 1000);
+
+      if (fadeSec >= DRONE_CROSSFADE_SEC - 0.1) {
+        this.crossfadeStartMs = performance.now();
+        this.isCrossfading = true;
+      }
+    } else {
+      this.isCrossfading = false;
+    }
+
+    this.onStateChange?.();
+  }
+
+  private createDroneBusForKey(key: MusicalKey): DroneBus {
+    const ctx = this.ctx!;
+    const channels = this.channels!;
+    const now = ctx.currentTime;
+
+    const keyInfo = MUSICAL_KEYS.find((k) => k.key === key)!;
+    // Place root comfortably between A1 (33) and G#2 (44) for consistent warm chest weight
+    const rootMidi = keyInfo.semitone >= 9 ? 24 + keyInfo.semitone : 36 + keyInfo.semitone;
+    // Strictly Root (1st) and Fifth (5th) across two octaves — NO 3rd!
+    const droneMidis = [
+      { midi: rootMidi, gain: 0.34, pan: -0.25 },
+      { midi: rootMidi + 7, gain: 0.25, pan: 0.28 },
+      { midi: rootMidi + 12, gain: 0.26, pan: -0.35 },
+      { midi: rootMidi + 19, gain: 0.18, pan: 0.38 },
+    ];
+
+    const busGain = ctx.createGain();
+    busGain.gain.value = 0;
+
+    const droneFilter = ctx.createBiquadFilter();
+    droneFilter.type = 'lowpass';
+    droneFilter.frequency.value = 720;
+    droneFilter.Q.value = 0.9;
+
+    // Gentle organic filter breathing LFO
+    const breathLfo = ctx.createOscillator();
+    breathLfo.type = 'sine';
+    breathLfo.frequency.value = 0.085;
+    const breathDepth = ctx.createGain();
+    breathDepth.gain.value = 175;
+    breathLfo.connect(breathDepth);
+    breathDepth.connect(droneFilter.frequency);
+    breathLfo.start(now);
+
+    const oscList: OscillatorNode[] = [breathLfo];
+    const nodeList: AudioNode[] = [breathDepth, droneFilter, busGain];
+
+    droneMidis.forEach((voiceSpec) => {
+      const freq = midiToFreq(voiceSpec.midi);
+
+      const sawA = ctx.createOscillator();
+      sawA.type = 'sawtooth';
+      sawA.frequency.value = freq;
+      sawA.detune.value = -6.5;
+
+      const sawB = ctx.createOscillator();
+      sawB.type = 'sawtooth';
+      sawB.frequency.value = freq;
+      sawB.detune.value = 6.5;
+
+      const tri = ctx.createOscillator();
+      tri.type = 'triangle';
+      tri.frequency.value = freq;
+
+      const panner = ctx.createStereoPanner();
+      panner.pan.value = voiceSpec.pan;
+
+      const noteGain = ctx.createGain();
+      noteGain.gain.value = voiceSpec.gain;
+
+      sawA.connect(noteGain);
+      sawB.connect(noteGain);
+      tri.connect(noteGain);
+      noteGain.connect(panner);
+      panner.connect(droneFilter);
+
+      sawA.start(now);
+      sawB.start(now);
+      tri.start(now);
+
+      oscList.push(sawA, sawB, tri);
+      nodeList.push(noteGain, panner);
+    });
+
+    droneFilter.connect(busGain);
+    busGain.connect(channels.keyDrone.input);
+
+    return {
+      busGain,
+      stopNodes: () => {
+        oscList.forEach((osc) => {
+          try {
+            osc.stop();
+            osc.disconnect();
+          } catch {
+            // Ignore
+          }
+        });
+        nodeList.forEach((n) => {
+          try {
+            n.disconnect();
+          } catch {
+            // Ignore
+          }
+        });
+      },
+    };
+  }
+
+  public dispose() {
+    this.panic();
+    if (this.activeDroneBus) {
+      this.activeDroneBus.stopNodes();
+      this.activeDroneBus = null;
+    }
+    if (this.shimmerHighOsc) {
+      try {
+        this.shimmerHighOsc.stop();
+      } catch {
+        // Ignore
+      }
+    }
+    if (this.ctx) {
+      this.ctx.close();
+      this.ctx = null;
+    }
+  }
+}

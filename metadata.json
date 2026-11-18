@@ -1,0 +1,6 @@
+{
+  "name": "SanctuaryKeys",
+  "description": "Stage-ready Web Audio Worship Piano & Ambient Pad Synthesizer with 4-layer polyphony, 12-key Root+5th crossfading drone, cathedral shimmer reverb, and Web MIDI support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
