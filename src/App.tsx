@@ -132,8 +132,13 @@ export default function App() {
   // 60fps Animation Frame loop for channel meters, drone crossfade bar, and scene morph UI interpolation
   useEffect(() => {
     let rafId = 0;
+    let lastLevelUpdate = 0;
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const levelIntervalMs = isMobile ? 250 : 0;
     const tick = () => {
-      if (engine.isRunning()) {
+      const nowMs = performance.now();
+      if (engine.isRunning() && nowMs - lastLevelUpdate >= levelIntervalMs) {
+        lastLevelUpdate = nowMs;
         setLevels(engine.getChannelLevels());
       }
 
