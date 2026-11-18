@@ -42,7 +42,11 @@ export interface VoiceTriggerOptions {
   delayOffsetSec?: number;
 }
 
-const MAX_POLY_VOICES = 24;
+const IS_MOBILE =
+  typeof navigator !== 'undefined' &&
+  /Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent);
+
+const MAX_POLY_VOICES = IS_MOBILE ? 12 : 18;
 const DRONE_CROSSFADE_SEC = 4.0;
 const SCENE_MORPH_SEC = 1.5;
 
@@ -103,7 +107,8 @@ export class WorshipAudioEngine {
   public async initOrResume(): Promise<boolean> {
     if (!this.ctx) {
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioCtx({ latencyHint: 'interactive' });
+      // Use playback buffer hint on mobile phones to prevent audio thread underrun crackles
+      this.ctx = new AudioCtx({ latencyHint: IS_MOBILE ? 'playback' : 'balanced' });
       this.buildGraph();
       this.isInitialized = true;
     }
@@ -120,14 +125,20 @@ export class WorshipAudioEngine {
     if (!this.ctx) return;
     const ctx = this.ctx;
 
-    // 1. Master Summing & Effects Chain
+    // 1. Master Summing & Effects Chain (calibrated headroom for polyphonic chords)
     this.preMasterSum = ctx.createGain();
-    this.preMasterSum.gain.value = 0.85;
+    this.preMasterSum.gain.value = 0.36;
+
+    // Strip subsonic <45Hz rumble that causes phone speakers to boom and rattle
+    const subsonicHP = ctx.createBiquadFilter();
+    subsonicHP.type = 'highpass';
+    subsonicHP.frequency.value = 45;
+    subsonicHP.Q.value = 0.7;
 
     this.masterFilter = ctx.createBiquadFilter();
     this.masterFilter.type = 'lowpass';
     this.masterFilter.frequency.value = this.shaping.filterCutoff;
-    this.masterFilter.Q.value = 1.05;
+    this.masterFilter.Q.value = 0.85;
 
     // Dry / Wet Cathedral + Shimmer Reverb Bus
     this.dryGain = ctx.createGain();
@@ -135,33 +146,35 @@ export class WorshipAudioEngine {
     this.applyReverbMixImmediate(this.shaping.reverbMix);
 
     this.reverbSend = ctx.createGain();
-    this.reverbSend.gain.value = 0.85;
+    this.reverbSend.gain.value = 0.72;
 
     this.convolver = ctx.createConvolver();
+    // Keep explicit IR gain without unpredictable RMS auto-boost
+    this.convolver.normalize = false;
     this.convolver.buffer = this.generateCathedralIR(this.shaping.reverbDecay);
 
-    // Stereo Feedback Delay & Shimmer Tail feeding the Cathedral Convolver
+    // Clean Stereo Feedback Delay feeding the Cathedral Convolver (no nonlinear waveshaper crackle)
     const delayInputLP = ctx.createBiquadFilter();
     delayInputLP.type = 'lowpass';
-    delayInputLP.frequency.value = 4600;
+    delayInputLP.frequency.value = 4200;
 
     const delayInputHP = ctx.createBiquadFilter();
     delayInputHP.type = 'highpass';
-    delayInputHP.frequency.value = 240;
+    delayInputHP.frequency.value = 280;
 
     this.shimmerDelayL = ctx.createDelay(2.0);
-    this.shimmerDelayL.delayTime.value = 0.31;
+    this.shimmerDelayL.delayTime.value = 0.29;
     this.shimmerDelayR = ctx.createDelay(2.0);
-    this.shimmerDelayR.delayTime.value = 0.44;
+    this.shimmerDelayR.delayTime.value = 0.41;
 
-    // Subtle LFO modulation on delay times for lush chorus/shimmer spread
+    // Gentle chorus modulation on delay tail
     const modLfo = ctx.createOscillator();
     modLfo.type = 'sine';
-    modLfo.frequency.value = 0.37;
+    modLfo.frequency.value = 0.24;
     const modDepthL = ctx.createGain();
-    modDepthL.gain.value = 0.0028;
+    modDepthL.gain.value = 0.0014;
     const modDepthR = ctx.createGain();
-    modDepthR.gain.value = -0.0025;
+    modDepthR.gain.value = -0.0012;
     modLfo.connect(modDepthL);
     modLfo.connect(modDepthR);
     modDepthL.connect(this.shimmerDelayL.delayTime);
@@ -170,39 +183,50 @@ export class WorshipAudioEngine {
     this.shimmerHighOsc = modLfo;
 
     this.shimmerFeedbackL = ctx.createGain();
-    this.shimmerFeedbackL.gain.value = 0.36;
+    this.shimmerFeedbackL.gain.value = 0.26;
     this.shimmerFeedbackR = ctx.createGain();
-    this.shimmerFeedbackR.gain.value = 0.34;
+    this.shimmerFeedbackR.gain.value = 0.24;
 
     const merger = ctx.createChannelMerger(2);
     const wetToneFilter = ctx.createBiquadFilter();
     wetToneFilter.type = 'lowpass';
-    wetToneFilter.frequency.value = 7200;
+    wetToneFilter.frequency.value = 6400;
 
     // Master Swell (Expression Pedal CC 11 / Slider)
     this.masterSwellGain = ctx.createGain();
     this.masterSwellGain.gain.value = this.shaping.masterSwell;
 
-    // Master Dynamics Limiter (Zero clipping guarantee)
+    // Master Dynamics Limiter
     this.masterLimiter = ctx.createDynamicsCompressor();
-    this.masterLimiter.threshold.value = -5.5;
-    this.masterLimiter.knee.value = 6.0;
-    this.masterLimiter.ratio.value = 12.0;
-    this.masterLimiter.attack.value = 0.003;
-    this.masterLimiter.release.value = 0.14;
+    this.masterLimiter.threshold.value = -10.0;
+    this.masterLimiter.knee.value = 10.0;
+    this.masterLimiter.ratio.value = 8.0;
+    this.masterLimiter.attack.value = 0.001;
+    this.masterLimiter.release.value = 0.22;
+
+    // Final soft-saturation ceiling so peak samples never exceed +/- 0.88 on phone DACs
+    const safetyClipper = ctx.createWaveShaper();
+    const clipLen = 1024;
+    const clipCurve = new Float32Array(clipLen);
+    for (let i = 0; i < clipLen; i++) {
+      const x = (i * 2) / (clipLen - 1) - 1;
+      clipCurve[i] = Math.tanh(x * 1.15) * 0.88;
+    }
+    safetyClipper.curve = clipCurve;
+    safetyClipper.oversample = IS_MOBILE ? 'none' : '2x';
 
     // Wire Master Signal Chain
-    this.preMasterSum.connect(this.masterFilter);
+    this.preMasterSum.connect(subsonicHP);
+    subsonicHP.connect(this.masterFilter);
 
     // Dry path
     this.masterFilter.connect(this.dryGain);
     this.dryGain.connect(this.masterSwellGain);
 
-    // Wet path: Filter -> Reverb Send -> Convolver + Cross-Feedback Delay Tail -> Wet Gain
+    // Wet path: Filter -> Reverb Send -> Convolver + Clean Stereo Delay Tail -> Wet Gain
     this.masterFilter.connect(this.reverbSend);
     this.reverbSend.connect(this.convolver);
 
-    // Cross-feedback stereo delay loop into Convolver
     this.reverbSend.connect(delayInputHP);
     delayInputHP.connect(delayInputLP);
     delayInputLP.connect(this.shimmerDelayL);
@@ -217,44 +241,13 @@ export class WorshipAudioEngine {
     this.shimmerDelayR.connect(merger, 0, 1);
     merger.connect(this.convolver);
 
-    // Subtle octave-up harmonic shimmer exciter into the cathedral reverb tail
-    const shimmerPreHP = ctx.createBiquadFilter();
-    shimmerPreHP.type = 'highpass';
-    shimmerPreHP.frequency.value = 420;
-
-    const shimmerShaper = ctx.createWaveShaper();
-    const curveLen = 512;
-    const shimmerCurve = new Float32Array(curveLen);
-    for (let i = 0; i < curveLen; i++) {
-      const x = (i * 2) / (curveLen - 1) - 1;
-      // Even-harmonic quadratic curve creates clean +1 octave (2f) shimmer overtones
-      shimmerCurve[i] = x * x * 0.55;
-    }
-    shimmerShaper.curve = shimmerCurve;
-
-    const shimmerPostHP = ctx.createBiquadFilter();
-    shimmerPostHP.type = 'highpass';
-    shimmerPostHP.frequency.value = 650;
-    const shimmerPostLP = ctx.createBiquadFilter();
-    shimmerPostLP.type = 'lowpass';
-    shimmerPostLP.frequency.value = 6200;
-
-    const shimmerTailGain = ctx.createGain();
-    shimmerTailGain.gain.value = 0.24;
-
-    merger.connect(shimmerPreHP);
-    shimmerPreHP.connect(shimmerShaper);
-    shimmerShaper.connect(shimmerPostHP);
-    shimmerPostHP.connect(shimmerPostLP);
-    shimmerPostLP.connect(shimmerTailGain);
-    shimmerTailGain.connect(this.convolver);
-
     this.convolver.connect(wetToneFilter);
     wetToneFilter.connect(this.wetGain);
     this.wetGain.connect(this.masterSwellGain);
 
     this.masterSwellGain.connect(this.masterLimiter);
-    this.masterLimiter.connect(ctx.destination);
+    this.masterLimiter.connect(safetyClipper);
+    safetyClipper.connect(ctx.destination);
 
     // 2. Build 5-Channel Mixer Buses
     const ids: ChannelId[] = ['feltPiano', 'warmPad', 'highShimmer', 'subBass', 'keyDrone'];
@@ -295,21 +288,22 @@ export class WorshipAudioEngine {
   private generateCathedralIR(decaySeconds: number): AudioBuffer {
     const ctx = this.ctx!;
     const sampleRate = ctx.sampleRate;
-    const length = Math.max(sampleRate * 1.5, Math.floor(sampleRate * decaySeconds));
+    // Cap IR length on mobile phones so convolution never starves the audio thread
+    const effectiveDecay = IS_MOBILE ? Math.min(decaySeconds, 2.8) : Math.min(decaySeconds, 6.0);
+    const length = Math.max(sampleRate, Math.floor(sampleRate * effectiveDecay));
     const buffer = ctx.createBuffer(2, length, sampleRate);
     const left = buffer.getChannelData(0);
     const right = buffer.getChannelData(1);
 
-    // Early reflections + smooth exponential cathedral tail with progressive high-frequency damping
+    // Smooth low-passed cathedral tail with calibrated gain (normalize = false)
     let lpL = 0;
     let lpR = 0;
-    const damp = 0.35;
+    const damp = 0.28;
 
     for (let i = 0; i < length; i++) {
       const t = i / sampleRate;
-      const env = Math.pow(1 - i / length, 2.4) * Math.exp((-3.2 * t) / decaySeconds);
-      // Slight fade-in on first 18ms so reverb blooms smoothly instead of clicking
-      const preBloom = t < 0.018 ? t / 0.018 : 1;
+      const env = Math.pow(1 - i / length, 2.2) * Math.exp((-3.0 * t) / effectiveDecay);
+      const preBloom = t < 0.025 ? t / 0.025 : 1;
 
       const whiteL = Math.random() * 2 - 1;
       const whiteR = Math.random() * 2 - 1;
@@ -317,18 +311,15 @@ export class WorshipAudioEngine {
       lpL = lpL + damp * (whiteL - lpL);
       lpR = lpR + damp * (whiteR - lpR);
 
-      // Subtle shimmer harmonic sparkle in upper tail
-      const shimmerBoost = Math.sin(t * 2.1) * 0.04 + 1;
-      left[i] = lpL * env * preBloom * 0.55 * shimmerBoost;
-      right[i] = lpR * env * preBloom * 0.55 * shimmerBoost;
+      left[i] = lpL * env * preBloom * 0.045;
+      right[i] = lpR * env * preBloom * 0.045;
     }
 
-    // Add a few discrete cathedral early reflection taps
-    const taps = [0.023, 0.041, 0.067, 0.098, 0.135];
+    const taps = [0.024, 0.043, 0.068, 0.097];
     taps.forEach((tapSec, idx) => {
       const idxSample = Math.floor(tapSec * sampleRate);
       if (idxSample < length) {
-        const amp = 0.14 / (idx + 1);
+        const amp = 0.032 / (idx + 1);
         left[idxSample] += amp * (idx % 2 === 0 ? 1 : 0.7);
         right[idxSample] += amp * (idx % 2 === 1 ? 1 : 0.7);
       }
@@ -693,19 +684,19 @@ export class WorshipAudioEngine {
     }
 
     const pianoEnv = ctx.createGain();
+    pianoEnv.gain.value = 0;
     if (isSoftSwell) {
-      const softPianoTarget = 0.18 * (0.45 + velocity * 0.55);
-      pianoEnv.gain.setValueAtTime(0, startAt);
+      const softPianoTarget = 0.15 * (0.45 + velocity * 0.55);
       pianoEnv.gain.setValueCurveAtTime(
         this.buildRisingCurve(softPianoTarget, 2.2),
-        startAt,
+        startAt + 0.002,
         Math.max(0.85, swellDuration * 0.65),
       );
     } else {
-      const pianoPeak = 0.42 * (0.45 + velocity * 0.55);
+      const pianoPeak = 0.34 * (0.45 + velocity * 0.55);
       const decayTime = Math.max(1.8, 4.6 - (midi - 36) * 0.045);
       pianoEnv.gain.setValueAtTime(0.0001, startAt);
-      pianoEnv.gain.linearRampToValueAtTime(pianoPeak, startAt + 0.008);
+      pianoEnv.gain.linearRampToValueAtTime(pianoPeak, startAt + 0.01);
       pianoEnv.gain.exponentialRampToValueAtTime(pianoPeak * 0.18, startAt + decayTime);
     }
 
@@ -749,14 +740,14 @@ export class WorshipAudioEngine {
     panR.pan.value = 0.58;
 
     const padSawGain = ctx.createGain();
-    padSawGain.gain.value = 0.24;
+    padSawGain.gain.value = 0.2;
     const padTriGain = ctx.createGain();
-    padTriGain.gain.value = 0.34;
+    padTriGain.gain.value = 0.28;
 
     const padFilter = ctx.createBiquadFilter();
     padFilter.type = 'lowpass';
-    const padTargetFreq = Math.min(3400, Math.max(950, freq * 3.2));
-    padFilter.Q.value = 0.8;
+    const padTargetFreq = Math.min(3200, Math.max(900, freq * 3.0));
+    padFilter.Q.value = 0.7;
     if (isSoftSwell) {
       padFilter.frequency.setValueAtTime(340, startAt);
       padFilter.frequency.exponentialRampToValueAtTime(padTargetFreq, startAt + swellDuration);
@@ -765,10 +756,14 @@ export class WorshipAudioEngine {
     }
 
     const padEnv = ctx.createGain();
-    const padTarget = 0.28 * (0.55 + velocity * 0.45);
+    padEnv.gain.value = 0;
+    const padTarget = 0.24 * (0.55 + velocity * 0.45);
     if (isSoftSwell) {
-      padEnv.gain.setValueAtTime(0, startAt);
-      padEnv.gain.setValueCurveAtTime(this.buildRisingCurve(padTarget, 2.4), startAt, swellDuration);
+      padEnv.gain.setValueCurveAtTime(
+        this.buildRisingCurve(padTarget, 2.4),
+        startAt + 0.002,
+        swellDuration,
+      );
     } else {
       padEnv.gain.setValueAtTime(0.0001, startAt);
       padEnv.gain.linearRampToValueAtTime(padTarget, startAt + this.shaping.padAttack);
@@ -814,20 +809,20 @@ export class WorshipAudioEngine {
     shimmerLfoGain.connect(shimmerBell.detune);
 
     const shimmerOscGain = ctx.createGain();
-    shimmerOscGain.gain.value = 0.24;
+    shimmerOscGain.gain.value = 0.22;
     const shimmerBellGain = ctx.createGain();
-    shimmerBellGain.gain.value = 0.07;
+    shimmerBellGain.gain.value = 0.06;
 
     const shimmerEnv = ctx.createGain();
+    shimmerEnv.gain.value = 0;
     const shimmerAttack = isSoftSwell
       ? swellDuration * 1.15
       : Math.max(0.35, this.shaping.padAttack * 0.85);
-    const shimmerTarget = 0.26 * (0.5 + velocity * 0.5);
+    const shimmerTarget = 0.22 * (0.5 + velocity * 0.5);
     if (isSoftSwell) {
-      shimmerEnv.gain.setValueAtTime(0, startAt);
       shimmerEnv.gain.setValueCurveAtTime(
         this.buildRisingCurve(shimmerTarget, 2.7),
-        startAt,
+        startAt + 0.002,
         shimmerAttack,
       );
     } else {
@@ -849,26 +844,25 @@ export class WorshipAudioEngine {
 
     // =========================================================================
     // LAYER 4: SUB-BASS LAYER
-    // Clean sine sub-octave (-12 semitones), gently rolled off in upper treble
+    // Clean sine sub-octave (-12 semitones), gently rolled off for phone speakers
     // =========================================================================
     const subOsc = ctx.createOscillator();
     subOsc.type = 'sine';
     subOsc.frequency.value = midiToFreq(midi - 12);
 
-    // Keep sub-bass authoritative in lower/mid registers without piercing high chords
     const registerScale = midi <= 60 ? 1.0 : Math.max(0.18, 1 - (midi - 60) * 0.045);
     const subEnv = ctx.createGain();
-    const subTarget = 0.34 * registerScale * (0.5 + velocity * 0.5);
+    subEnv.gain.value = 0;
+    const subTarget = 0.2 * registerScale * (0.5 + velocity * 0.5);
     if (isSoftSwell) {
-      subEnv.gain.setValueAtTime(0, startAt);
       subEnv.gain.setValueCurveAtTime(
         this.buildRisingCurve(subTarget * 0.8, 2.0),
-        startAt,
+        startAt + 0.002,
         Math.max(0.9, swellDuration * 0.7),
       );
     } else {
       subEnv.gain.setValueAtTime(0.0001, startAt);
-      subEnv.gain.linearRampToValueAtTime(subTarget, startAt + 0.035);
+      subEnv.gain.linearRampToValueAtTime(subTarget, startAt + 0.04);
     }
 
     subOsc.connect(subEnv);
@@ -931,10 +925,11 @@ export class WorshipAudioEngine {
 
     const rampOut = (gainNode: GainNode, duration: number) => {
       const param = gainNode.gain;
-      const val = Math.max(0.0001, param.value);
+      const val = Math.max(0, param.value);
       param.cancelScheduledValues(now);
       param.setValueAtTime(val, now);
-      param.exponentialRampToValueAtTime(0.0001, now + duration);
+      // Smooth exponential decay to true zero without WebKit curve collisions
+      param.setTargetAtTime(0, now, Math.max(0.015, duration / 4));
     };
 
     rampOut(voice.pianoEnv, pianoRel);
@@ -945,7 +940,7 @@ export class WorshipAudioEngine {
     voice.stopTimeout = window.setTimeout(() => {
       voice.cleanup();
       this.onStateChange?.();
-    }, (maxRel + 0.08) * 1000);
+    }, (maxRel + 0.15) * 1000);
   }
 
   // --- Independent Continuous Key Drone Engine (Root + 5th across 2 octaves, no 3rd) ---
@@ -1017,9 +1012,9 @@ export class WorshipAudioEngine {
       fadeOutCurve[i] = Math.cos(t * Math.PI * 0.5);
     }
 
+    incoming.busGain.gain.value = 0;
     incoming.busGain.gain.cancelScheduledValues(now);
-    incoming.busGain.gain.setValueAtTime(0, now);
-    incoming.busGain.gain.setValueCurveAtTime(fadeInCurve, now, fadeSec);
+    incoming.busGain.gain.setValueCurveAtTime(fadeInCurve, now + 0.002, fadeSec);
 
     if (outgoing) {
       const startLevel = Math.max(0.001, outgoing.busGain.gain.value);
@@ -1028,8 +1023,7 @@ export class WorshipAudioEngine {
         scaledOut[i] = fadeOutCurve[i] * startLevel;
       }
       outgoing.busGain.gain.cancelScheduledValues(now);
-      outgoing.busGain.gain.setValueAtTime(startLevel, now);
-      outgoing.busGain.gain.setValueCurveAtTime(scaledOut, now, fadeSec);
+      outgoing.busGain.gain.setValueCurveAtTime(scaledOut, now + 0.002, fadeSec);
 
       if (this.outgoingDroneCleanupTimer) clearTimeout(this.outgoingDroneCleanupTimer);
       this.outgoingDroneCleanupTimer = window.setTimeout(() => {
@@ -1057,10 +1051,10 @@ export class WorshipAudioEngine {
     const rootMidi = keyInfo.semitone >= 9 ? 24 + keyInfo.semitone : 36 + keyInfo.semitone;
     // Strictly Root (1st) and Fifth (5th) across two octaves — NO 3rd!
     const droneMidis = [
-      { midi: rootMidi, gain: 0.34, pan: -0.25 },
-      { midi: rootMidi + 7, gain: 0.25, pan: 0.28 },
-      { midi: rootMidi + 12, gain: 0.26, pan: -0.35 },
-      { midi: rootMidi + 19, gain: 0.18, pan: 0.38 },
+      { midi: rootMidi, gain: 0.22, pan: -0.25 },
+      { midi: rootMidi + 7, gain: 0.17, pan: 0.28 },
+      { midi: rootMidi + 12, gain: 0.17, pan: -0.35 },
+      { midi: rootMidi + 19, gain: 0.12, pan: 0.38 },
     ];
 
     const busGain = ctx.createGain();
