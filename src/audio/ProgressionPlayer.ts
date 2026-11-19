@@ -25,6 +25,59 @@ const QUALITY_SUFFIX: Record<ChordQuality, string> = {
   sus4: 'sus4',
 };
 
+export const CHORD_QUALITIES: { id: ChordQuality; label: string; suffix: string }[] = [
+  { id: 'maj', label: 'Major', suffix: '' },
+  { id: 'min', label: 'Minor', suffix: 'm' },
+  { id: 'maj7', label: 'maj7', suffix: 'maj7' },
+  { id: 'm7', label: 'm7', suffix: 'm7' },
+  { id: 'add9', label: 'add9', suffix: 'add9' },
+  { id: 'madd9', label: 'm(add9)', suffix: 'm(add9)' },
+  { id: 'sus2', label: 'sus2', suffix: 'sus2' },
+  { id: 'sus4', label: 'sus4', suffix: 'sus4' },
+];
+
+export const DEGREE_OPTIONS: {
+  offset: number;
+  majorNumeral: string;
+  minorNumeral: string;
+  diatonicMajor: boolean;
+  diatonicMinor: boolean;
+}[] = [
+  { offset: 0, majorNumeral: 'I', minorNumeral: 'i', diatonicMajor: true, diatonicMinor: true },
+  { offset: 1, majorNumeral: 'bII', minorNumeral: 'bII', diatonicMajor: false, diatonicMinor: false },
+  { offset: 2, majorNumeral: 'ii', minorNumeral: 'ii', diatonicMajor: true, diatonicMinor: true },
+  { offset: 3, majorNumeral: 'bIII', minorNumeral: 'III', diatonicMajor: false, diatonicMinor: true },
+  { offset: 4, majorNumeral: 'iii', minorNumeral: 'iii', diatonicMajor: true, diatonicMinor: false },
+  { offset: 5, majorNumeral: 'IV', minorNumeral: 'iv', diatonicMajor: true, diatonicMinor: true },
+  { offset: 6, majorNumeral: '#IV', minorNumeral: '#iv', diatonicMajor: false, diatonicMinor: false },
+  { offset: 7, majorNumeral: 'V', minorNumeral: 'v', diatonicMajor: true, diatonicMinor: true },
+  { offset: 8, majorNumeral: 'bVI', minorNumeral: 'VI', diatonicMajor: false, diatonicMinor: true },
+  { offset: 9, majorNumeral: 'vi', minorNumeral: 'vi', diatonicMajor: true, diatonicMinor: false },
+  { offset: 10, majorNumeral: 'bVII', minorNumeral: 'VII', diatonicMajor: false, diatonicMinor: true },
+  { offset: 11, majorNumeral: 'vii', minorNumeral: 'vii', diatonicMajor: false, diatonicMinor: false },
+];
+
+export function getChordNumeral(offset: number, quality: ChordQuality): string {
+  const norm = ((offset % 12) + 12) % 12;
+  const minorQuality = quality === 'min' || quality === 'm7' || quality === 'madd9';
+  const baseUpper: Record<number, string> = {
+    0: 'I',
+    1: 'bII',
+    2: 'II',
+    3: 'bIII',
+    4: 'III',
+    5: 'IV',
+    6: '#IV',
+    7: 'V',
+    8: 'bVI',
+    9: 'VI',
+    10: 'bVII',
+    11: 'VII',
+  };
+  const num = baseUpper[norm] ?? 'I';
+  return minorQuality ? num.replace(/[IV]+$/, (m) => m.toLowerCase()) : num;
+}
+
 export interface ProgressionChord {
   offset: number; // semitones above the key's tonic
   quality: ChordQuality;
@@ -34,7 +87,7 @@ export interface ProgressionChord {
 export interface ProgressionPreset {
   id: string;
   name: string;
-  mode: 'major' | 'minor';
+  mode: 'major' | 'minor' | 'custom';
   description: string;
   chords: ProgressionChord[];
 }
@@ -151,20 +204,19 @@ export const PROGRESSIONS: ProgressionPreset[] = [
 export type PlayStyle = 'block' | 'rolled' | 'arpeggio' | 'pulse';
 
 export const PLAY_STYLES: { id: PlayStyle; name: string; description: string }[] = [
-  { id: 'block', name: 'Sustained Chords', description: 'Full chords that ring and breathe. Calmest option.' },
-  { id: 'rolled', name: 'Rolled Chords', description: 'Chords spread gently from the bass upward.' },
-  { id: 'arpeggio', name: 'Soft Arpeggio', description: 'Flowing broken chords. Gives the most movement.' },
-  { id: 'pulse', name: 'Driving Pulse', description: 'Short, firm chord hits on a worship-band rhythm. Pairs well with pads and the hard piano tones.' },
+  { id: 'block', name: 'Sustained Swell', description: 'Smooth 5-note pad chords that bloom and crossfade gently.' },
+  { id: 'rolled', name: 'Rolled Bloom', description: 'Pad notes rise gently from low bass to upper shimmer.' },
+  { id: 'arpeggio', name: 'Flowing Motion', description: 'Gentle broken pad movement across two octaves.' },
+  { id: 'pulse', name: 'Warm Pulse', description: 'Rhythmic pad swells on a worship pulse.' },
 ];
 
 export interface PlayerConfig {
   progressionId: string;
+  customProgression?: ProgressionPreset | null;
   style: PlayStyle;
   bpm: number; // beats per minute
   beatsPerChord: number; // 4 = one bar, 8 = two bars
   level: number; // 0.2 to 1
-  padLayer: boolean; // hold a soft pad under the piano
-  padLevel: number; // 0.2 to 1
   key: MusicalKey;
 }
 
@@ -173,9 +225,7 @@ export const DEFAULT_PLAYER_CONFIG: PlayerConfig = {
   style: 'block',
   bpm: 60,
   beatsPerChord: 4,
-  level: 0.6,
-  padLayer: false,
-  padLevel: 0.6,
+  level: 0.65,
   key: 'C',
 };
 
@@ -197,34 +247,52 @@ export function progressionLabels(preset: ProgressionPreset, key: MusicalKey): s
 }
 
 interface VoicedChord {
-  bass: number;
+  lowBass: number;
+  octBass: number;
   upper: number[];
   meanUpper: number;
 }
 
-// Bass note in C2-B2; upper notes as a close voicing near middle C, picking the inversion
-// that moves least from the previous chord so the progression sounds smooth.
+// Concert grand piano 5-note, 2-octave voicing:
+// Left hand plays a full bass octave (C2–B2 + C3–B3), right hand plays 3 singing voices
+// in the upper octave (F4–G5) with smooth voice-leading between chords.
 function voiceChord(rootPc: number, quality: ChordQuality, prevMean: number | null): VoicedChord {
-  const bass = 36 + rootPc;
-  let rootUp = 48 + rootPc;
-  while (rootUp < 55) rootUp += 12;
-  const stack = QUALITY_INTERVALS[quality].map((i) => rootUp + i);
+  const lowBass = 36 + rootPc;
+  const octBass = lowBass + 12;
+
+  const intervals = QUALITY_INTERVALS[quality];
+  // For 4-note chords (maj7, m7, add9, madd9), take 3rd + 5th + color tone since root is doubled in left hand
+  const upperIntervals = intervals.length >= 4 ? intervals.slice(1, 4) : intervals.slice(0, 3);
+
+  let rootUp = 60 + rootPc;
+  if (rootUp > 67) rootUp -= 12; // keep upper center nicely around Middle C4..G4..E5
+  const stack = upperIntervals.map((i) => rootUp + i);
 
   let best: number[] = stack;
   let bestCost = Number.POSITIVE_INFINITY;
-  const target = prevMean ?? 66;
+  const target = prevMean ?? 68;
   for (let k = 0; k < stack.length; k++) {
     const candidate = [...stack.slice(k), ...stack.slice(0, k).map((n) => n + 12)].sort((a, b) => a - b);
+    // Open up top note by an octave if chord spans less than a 5th for grand spaciousness
+    if (candidate[candidate.length - 1] - candidate[0] < 6) {
+      candidate[0] -= 12;
+      candidate.sort((a, b) => a - b);
+    }
     const mean = candidate.reduce((a, b) => a + b, 0) / candidate.length;
     let cost = Math.abs(mean - target);
-    if (candidate[candidate.length - 1] > 79) cost += 20;
-    if (candidate[0] < 55) cost += 20;
+    if (candidate[candidate.length - 1] > 81) cost += 20;
+    if (candidate[0] < 57) cost += 20;
     if (cost < bestCost) {
       bestCost = cost;
       best = candidate;
     }
   }
-  return { bass, upper: best, meanUpper: best.reduce((a, b) => a + b, 0) / best.length };
+  return {
+    lowBass,
+    octBass,
+    upper: best,
+    meanUpper: best.reduce((a, b) => a + b, 0) / best.length,
+  };
 }
 
 interface PlayEvent {
@@ -236,30 +304,36 @@ interface PlayEvent {
 
 function buildEvents(voiced: VoicedChord, style: PlayStyle, beatsPerChord: number): PlayEvent[] {
   const events: PlayEvent[] = [];
-  const { bass, upper } = voiced;
+  const { lowBass, octBass, upper } = voiced;
+  const allFive = [lowBass, octBass, ...upper];
 
   if (style === 'block') {
-    events.push({ beat: 0, midi: bass, velocity: 0.9 });
-    upper.forEach((m, i) => events.push({ beat: 0.04 * i, midi: m, velocity: 0.8 }));
-    if (beatsPerChord >= 8) {
-      upper.forEach((m, i) => events.push({ beat: 4 + 0.04 * i, midi: m, velocity: 0.5 }));
-    }
+    events.push({ beat: 0, midi: lowBass, velocity: 0.92 });
+    events.push({ beat: 0.02, midi: octBass, velocity: 0.84 });
+    upper.forEach((m, i) => events.push({ beat: 0.04 + 0.025 * i, midi: m, velocity: 0.8 }));
     return events;
   }
 
   if (style === 'pulse') {
-    // Worship-band rhythm: bass on 1 and 3, chord hits on 1, the "and" of 2, and 4 ("x . . x . x . .")
+    // Worship-band rhythm: full bass octave on 1 and 3, 3-note upper chord hits on 1, and-of-2, and 4
     const bars = beatsPerChord >= 8 ? [0, 4] : [0];
     bars.forEach((start) => {
-      events.push({ beat: start, midi: bass, velocity: 0.95, holdBeats: 1.9 });
-      events.push({ beat: start + 2, midi: bass, velocity: 0.8, holdBeats: 1.9 });
+      events.push({ beat: start, midi: lowBass, velocity: 0.95, holdBeats: 1.9 });
+      events.push({ beat: start + 0.01, midi: octBass, velocity: 0.84, holdBeats: 1.9 });
+      events.push({ beat: start + 2, midi: lowBass, velocity: 0.82, holdBeats: 1.9 });
+      events.push({ beat: start + 2.01, midi: octBass, velocity: 0.72, holdBeats: 1.9 });
       [
         { b: 0, v: 1, hold: 1.3 },
         { b: 1.5, v: 0.78, hold: 0.9 },
         { b: 2.5, v: 0.9, hold: 1.3 },
       ].forEach(({ b, v, hold }) => {
         upper.forEach((m) =>
-          events.push({ beat: start + b, midi: m, velocity: v * 0.85, holdBeats: Math.min(hold, beatsPerChord - start - b - 0.05) }),
+          events.push({
+            beat: start + b,
+            midi: m,
+            velocity: v * 0.86,
+            holdBeats: Math.min(hold, beatsPerChord - start - b - 0.05),
+          }),
         );
       });
     });
@@ -267,29 +341,34 @@ function buildEvents(voiced: VoicedChord, style: PlayStyle, beatsPerChord: numbe
   }
 
   if (style === 'rolled') {
-    const rollStep = 0.25;
+    const rollStep = 0.2;
     const repeats = beatsPerChord >= 8 ? [0, 4] : [0];
     repeats.forEach((start, r) => {
-      const v = r === 0 ? 1 : 0.62;
-      events.push({ beat: start, midi: bass, velocity: 0.9 * v });
-      upper.forEach((m, i) =>
-        events.push({ beat: start + rollStep * (i + 1), midi: m, velocity: 0.78 * v }),
+      const v = r === 0 ? 1 : 0.65;
+      allFive.forEach((m, i) =>
+        events.push({
+          beat: start + rollStep * i,
+          midi: m,
+          velocity: (i === 0 ? 0.92 : i === 1 ? 0.84 : 0.8) * v,
+        }),
       );
     });
     return events;
   }
 
-  // arpeggio: eighth notes. Bass on every half bar, upper notes flowing up and back down.
+  // arpeggio: eighth notes sweeping across all 5 notes in 2+ octaves
   const slots = beatsPerChord * 2;
-  const cycle = [...upper, ...upper.slice(1, -1).reverse()];
+  const arpPattern = [lowBass, octBass, upper[0], upper[1], upper[2], upper[1], upper[0], octBass];
   for (let slot = 0; slot < slots; slot++) {
     const beat = slot * 0.5;
-    if (slot % 4 === 0) {
-      events.push({ beat, midi: bass, velocity: slot === 0 ? 0.9 : 0.7, holdBeats: Math.min(3, beatsPerChord - beat - 0.05) });
-    } else {
-      const m = cycle[(slot - 1) % cycle.length];
-      events.push({ beat, midi: m, velocity: 0.62, holdBeats: Math.min(2.5, beatsPerChord - beat - 0.05) });
-    }
+    const m = arpPattern[slot % arpPattern.length];
+    const isBass = slot % 8 === 0;
+    events.push({
+      beat,
+      midi: m,
+      velocity: isBass ? 0.9 : slot % 8 === 4 ? 0.78 : 0.66,
+      holdBeats: Math.min(isBass ? 3.5 : 2.2, beatsPerChord - beat - 0.05),
+    });
   }
   return events;
 }
@@ -305,7 +384,6 @@ export class ProgressionPlayer {
   private timer: number | null = null;
   private queue: ScheduledItem[] = [];
   private held = new Set<number>();
-  private padHeld = new Set<number>();
   private strikeIds = new Map<number, number>();
   private strikeCounter = 0;
   private chordIndex = 0;
@@ -357,19 +435,18 @@ export class ProgressionPlayer {
   }
 
   private releaseAllHeld() {
-    this.held.forEach((m) => this.engine.releaseNote(m, 'piano'));
+    this.held.forEach((m) => this.engine.releaseNote(m, 'pad'));
     this.held.clear();
-    this.padHeld.forEach((m) => this.engine.releaseNote(m, 'pad'));
-    this.padHeld.clear();
   }
 
   private strike(midi: number, velocity: number): number {
-    const jitter = (Math.random() - 0.5) * 0.08;
-    const v = Math.max(0.1, Math.min(1, this.config.level * velocity + jitter));
+    const jitter = (Math.random() - 0.5) * 0.06;
+    const v = Math.max(0.15, Math.min(1, this.config.level * velocity + jitter));
     this.held.add(midi);
     const token = ++this.strikeCounter;
     this.strikeIds.set(midi, token);
-    void this.engine.noteOn(midi, v, { pianoOnly: true });
+    const useSoftSwell = this.config.style === 'block' || this.config.style === 'rolled';
+    void this.engine.noteOn(midi, v, { padOnly: true, softSwell: useSoftSwell });
     return token;
   }
 
@@ -377,37 +454,16 @@ export class ProgressionPlayer {
     // Only release the strike this timer belongs to (not a later re-strike of the same pitch)
     if (this.held.has(midi) && this.strikeIds.get(midi) === token) {
       this.held.delete(midi);
-      this.engine.releaseNote(midi, 'piano');
+      this.engine.releaseNote(midi, 'pad');
     }
-  }
-
-  // Soft pad under the piano: root, fifth and third. Notes shared with the previous chord keep sounding.
-  private updatePad(rootPc: number, quality: ChordQuality) {
-    const wanted = new Set<number>();
-    if (this.config.padLayer) {
-      const root = 48 + rootPc;
-      const third = QUALITY_INTERVALS[quality][1];
-      [root, root + 7, root + 12 + third].forEach((m) => wanted.add(m));
-    }
-    this.padHeld.forEach((m) => {
-      if (!wanted.has(m)) {
-        this.engine.releaseNote(m, 'pad');
-        this.padHeld.delete(m);
-      }
-    });
-    wanted.forEach((m) => {
-      if (!this.padHeld.has(m)) {
-        this.padHeld.add(m);
-        void this.engine.noteOn(m, Math.max(0.2, Math.min(1, this.config.padLevel)), {
-          padOnly: true,
-          softSwell: false,
-        });
-      }
-    });
   }
 
   private beginChord(startAt: number) {
-    const preset = getProgression(this.config.progressionId);
+    const preset =
+      this.config.customProgression && this.config.customProgression.id === this.config.progressionId
+        ? this.config.customProgression
+        : getProgression(this.config.progressionId);
+    if (preset.chords.length === 0) return;
     if (this.chordIndex >= preset.chords.length) this.chordIndex = 0;
     const chord = preset.chords[this.chordIndex];
     const index = this.chordIndex;
@@ -417,10 +473,9 @@ export class ProgressionPlayer {
     const voiced = voiceChord(rootPc, chord.quality, this.prevMean);
     this.prevMean = voiced.meanUpper;
 
-    // Let the previous piano chord go, then play the new one
-    this.held.forEach((m) => this.engine.releaseNote(m, 'piano'));
+    // Crossfade previous pad chord out smoothly as the new pad chord swells in
+    this.held.forEach((m) => this.engine.releaseNote(m, 'pad'));
     this.held.clear();
-    this.updatePad(rootPc, chord.quality);
     this.onChordChange?.(index);
 
     const events = buildEvents(voiced, this.config.style, this.config.beatsPerChord);

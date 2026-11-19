@@ -1,4 +1,4 @@
-import { PianoToneParams, getPianoTone } from './pianoTones';
+import { DEFAULT_PIANO_TONE_ID, PianoToneParams, getPianoTone } from './pianoTones';
 import {
   ChannelId,
   ChannelState,
@@ -58,9 +58,9 @@ const MAX_POLY_VOICES = IS_MOBILE ? 5 : 18;
 const MAX_REVERB_SEC = IS_MOBILE ? 1.8 : 10;
 // Phones run the whole engine at half sample-rate (about half the CPU work).
 const MOBILE_SAMPLE_RATE = 24000;
-// Piano-only voices (background player) are about a third of the cost of a full voice.
-const MAX_PIANO_ONLY_VOICES = IS_MOBILE ? 10 : 24;
-const MAX_PAD_ONLY_VOICES = IS_MOBILE ? 6 : 12;
+// Piano-only voices (background player): headroom for 5-note 2-octave grand piano chords
+const MAX_PIANO_ONLY_VOICES = IS_MOBILE ? 14 : 28;
+const MAX_PAD_ONLY_VOICES = IS_MOBILE ? 10 : 20;
 // The convolution reverb is the heaviest single node. Off on phones; echo tail is used instead.
 // Set to true to bring it back on phones.
 const MOBILE_CONVOLVER = false;
@@ -88,7 +88,10 @@ export class WorshipAudioEngine {
   private wetGain: GainNode | null = null;
   private reverbSend: GainNode | null = null;
   private convolver: ConvolverNode | null = null;
-  private pianoTone: PianoToneParams = getPianoTone('felt').params;
+  private pianoTone: PianoToneParams = getPianoTone(DEFAULT_PIANO_TONE_ID).params;
+  private pianoWaves: Record<string, PeriodicWave> = {};
+  private pianoUpperWaves: Record<string, PeriodicWave> = {};
+  private hammerBuffer: AudioBuffer | null = null;
   private panicListeners = new Set<() => void>();
   private shimmerDelayL: DelayNode | null = null;
   private shimmerDelayR: DelayNode | null = null;
@@ -312,10 +315,58 @@ export class WorshipAudioEngine {
       analyser.fftSize = 256;
       analyser.smoothingTimeConstant = 0.72;
 
-      input.connect(faderGain);
-      faderGain.connect(muteSoloGain);
-      muteSoloGain.connect(analyser);
-      analyser.connect(this.preMasterSum);
+      if (id === 'feltPiano') {
+        // 9-foot Concert Grand soundboard cabinet EQ (built once per graph, zero per-note CPU)
+        const boardLowCut = ctx.createBiquadFilter();
+        boardLowCut.type = 'highpass';
+        boardLowCut.frequency.value = 28;
+        boardLowCut.Q.value = 0.7;
+
+        const boardChest = ctx.createBiquadFilter();
+        boardChest.type = 'peaking';
+        boardChest.frequency.value = 145;
+        boardChest.Q.value = 0.85;
+        boardChest.gain.value = 2.6;
+
+        const boardWood = ctx.createBiquadFilter();
+        boardWood.type = 'peaking';
+        boardWood.frequency.value = 380;
+        boardWood.Q.value = 0.8;
+        boardWood.gain.value = 1.2;
+
+        const boardSilk = ctx.createBiquadFilter();
+        boardSilk.type = 'highshelf';
+        boardSilk.frequency.value = 3000;
+        boardSilk.gain.value = -2.2;
+
+        input.connect(boardLowCut);
+        boardLowCut.connect(boardChest);
+        boardChest.connect(boardWood);
+        boardWood.connect(boardSilk);
+        boardSilk.connect(faderGain);
+
+        faderGain.connect(muteSoloGain);
+        muteSoloGain.connect(analyser);
+
+        // Route piano dry-forward straight to master swell, bypassing the dark pad filter & chorus-shimmer wash
+        const pianoDirect = ctx.createGain();
+        pianoDirect.gain.value = 0.46;
+        analyser.connect(pianoDirect);
+        pianoDirect.connect(this.masterSwellGain);
+
+        // Light natural concert hall room ambiance (unmodulated, zero pad wash)
+        if (USE_CONVOLVER) {
+          const pianoRoomSend = ctx.createGain();
+          pianoRoomSend.gain.value = 0.1;
+          analyser.connect(pianoRoomSend);
+          pianoRoomSend.connect(this.convolver);
+        }
+      } else {
+        input.connect(faderGain);
+        faderGain.connect(muteSoloGain);
+        muteSoloGain.connect(analyser);
+        analyser.connect(this.preMasterSum);
+      }
 
       buses[id] = {
         input,
@@ -327,7 +378,83 @@ export class WorshipAudioEngine {
     }
 
     this.channels = buses;
+    this.buildAcousticPianoAssets(ctx);
     this.recomputeMuteSolo();
+  }
+
+  // Precompute Concert Grand string harmonic tables (wound bass + singing treble) & wool-felt hammer buffer
+  private buildAcousticPianoAssets(ctx: AudioContext) {
+    // Tier 1: rich concert grand string body (strong 2nd/3rd harmonics in bass give real grand piano authority)
+    const bodyProfiles: Record<PianoToneParams['waveProfile'], Record<'bass' | 'mid' | 'treble', number[]>> = {
+      grand: {
+        bass: [0, 0.82, 1.0, 0.78, 0.56, 0.36, 0.22, 0.13, 0.07, 0.035],
+        mid: [0, 1.0, 0.62, 0.34, 0.17, 0.085, 0.04, 0.018],
+        treble: [0, 1.0, 0.42, 0.14, 0.04, 0.01],
+      },
+      warm: {
+        bass: [0, 0.86, 1.0, 0.7, 0.46, 0.28, 0.15, 0.075],
+        mid: [0, 1.0, 0.54, 0.26, 0.12, 0.05, 0.02],
+        treble: [0, 1.0, 0.32, 0.09, 0.02],
+      },
+      upright: {
+        bass: [0, 0.76, 1.0, 0.8, 0.58, 0.38, 0.24, 0.14, 0.08],
+        mid: [0, 1.0, 0.64, 0.38, 0.2, 0.1, 0.048],
+        treble: [0, 1.0, 0.45, 0.16, 0.048],
+      },
+      felt: {
+        bass: [0, 0.92, 0.85, 0.5, 0.26, 0.12, 0.05],
+        mid: [0, 1.0, 0.4, 0.14, 0.045, 0.015],
+        treble: [0, 1.0, 0.24, 0.05],
+      },
+    };
+
+    // Tier 2: gentle steel-string overtone warmth at 2*freq (no harsh metallic mini-piano chime)
+    const upperProfiles: Record<PianoToneParams['waveProfile'], number[]> = {
+      grand: [0, 0.65, 0.28, 0.1, 0.035],
+      warm: [0, 0.55, 0.2, 0.06],
+      upright: [0, 0.72, 0.34, 0.13, 0.045],
+      felt: [0, 0.42, 0.12, 0.03],
+    };
+
+    const waves: Record<string, PeriodicWave> = {};
+    const upperWaves: Record<string, PeriodicWave> = {};
+    (Object.keys(bodyProfiles) as PianoToneParams['waveProfile'][]).forEach((profile) => {
+      (['bass', 'mid', 'treble'] as const).forEach((reg) => {
+        const harmonics = bodyProfiles[profile][reg];
+        const real = new Float32Array(harmonics.length);
+        const imag = new Float32Array(harmonics.length);
+        for (let n = 1; n < harmonics.length; n++) {
+          imag[n] = harmonics[n];
+          real[n] = harmonics[n] * (n % 2 === 0 ? 0.06 : -0.04);
+        }
+        waves[`${profile}-${reg}`] = ctx.createPeriodicWave(real, imag, { disableNormalization: false });
+      });
+
+      const uh = upperProfiles[profile];
+      const uReal = new Float32Array(uh.length);
+      const uImag = new Float32Array(uh.length);
+      for (let n = 1; n < uh.length; n++) {
+        uImag[n] = uh[n];
+      }
+      upperWaves[profile] = ctx.createPeriodicWave(uReal, uImag, { disableNormalization: false });
+    });
+    this.pianoWaves = waves;
+    this.pianoUpperWaves = upperWaves;
+
+    // 55ms heavy wool-felt hammer thump + warm wood bridge knock
+    const len = Math.max(256, Math.floor(ctx.sampleRate * 0.055));
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    let lp = 0;
+    for (let i = 0; i < len; i++) {
+      const t = i / ctx.sampleRate;
+      const knock = Math.sin(2 * Math.PI * 105 * t) * Math.exp(-t / 0.008) * 0.65;
+      const white = Math.random() * 2 - 1;
+      lp = lp + 0.28 * (white - lp);
+      const feltEnv = Math.exp(-t / 0.009);
+      data[i] = knock + lp * feltEnv * 0.68;
+    }
+    this.hammerBuffer = buf;
   }
 
   private generateCathedralIR(decaySeconds: number): AudioBuffer {
@@ -715,96 +842,157 @@ export class WorshipAudioEngine {
     const isSoftSwell = Boolean(options?.softSwell);
     const swellDuration = Math.max(1.5, this.shaping.padAttack * 1.45);
 
-    const nodesToStop: OscillatorNode[] = [];
+    const nodesToStop: (OscillatorNode | AudioBufferSourceNode)[] = [];
     const nodesToDisconnect: AudioNode[] = [];
 
     // =========================================================================
-    // LAYER 1: FELT ACOUSTIC PIANO
-    // Triangle + Sine oscillators with short pluck filter envelope & warm roll-off
+    // LAYER 1: CONCERT ACOUSTIC GRAND PIANO (Un-padded, full-bodied)
+    // Micro-unison grand string pair + stretched upper steel overtones +
+    // heavy wool-felt hammer thump
     // =========================================================================
     const tone = this.pianoTone;
-    const pFreq = freq * Math.pow(2, tone.pitchShift / 12);
+    const register: 'bass' | 'mid' | 'treble' = midi < 54 ? 'bass' : midi < 72 ? 'mid' : 'treble';
+    const bodyWave = this.pianoWaves[`${tone.waveProfile}-${register}`];
+    const upperWave = this.pianoUpperWaves[tone.waveProfile];
 
-    const pianoTri = ctx.createOscillator();
-    pianoTri.type = tone.triType;
-    pianoTri.frequency.value = pFreq;
+    const stringBody = ctx.createOscillator();
+    if (bodyWave) stringBody.setPeriodicWave(bodyWave);
+    else stringBody.type = 'triangle';
+    stringBody.frequency.value = freq;
+    stringBody.detune.value = -tone.unisonCents;
 
-    const pianoSine = ctx.createOscillator();
-    pianoSine.type = 'sine';
-    pianoSine.frequency.value = pFreq;
+    // Micro-unison grand piano string partner on desktop (0.55 cents gives 3D grand size without chorus wobble)
+    const stringBodyB = !IS_MOBILE ? ctx.createOscillator() : null;
+    if (stringBodyB) {
+      if (bodyWave) stringBodyB.setPeriodicWave(bodyWave);
+      else stringBodyB.type = 'triangle';
+      stringBodyB.frequency.value = freq;
+      stringBodyB.detune.value = tone.unisonCents;
+    }
 
-    const pianoHarmonic = ctx.createOscillator();
-    pianoHarmonic.type = 'sine';
-    pianoHarmonic.frequency.value = pFreq * tone.harmMult;
+    // Tier 2: Upper steel-string harmonics at 2x pitch with subtle inharmonic stretch
+    const stringUpper = ctx.createOscillator();
+    if (upperWave) stringUpper.setPeriodicWave(upperWave);
+    else stringUpper.type = 'sine';
+    stringUpper.frequency.value = freq * 2;
+    stringUpper.detune.value = tone.stretchCents;
 
-    const pianoTriGain = ctx.createGain();
-    pianoTriGain.gain.value = tone.triGain;
-    const pianoSineGain = ctx.createGain();
-    pianoSineGain.gain.value = tone.sineGain;
-    const pianoHarmGain = ctx.createGain();
-    pianoHarmGain.gain.value = (isSoftSwell ? tone.harmGain * 0.4 : tone.harmGain) * velocity;
+    const bodyGain = ctx.createGain();
+    bodyGain.gain.value = stringBodyB ? 0.5 : 0.92;
+    const bodyBGain = stringBodyB ? ctx.createGain() : null;
+    if (bodyBGain) bodyBGain.gain.value = 0.44;
+    const upperGain = ctx.createGain();
+    upperGain.gain.value = 0;
 
     const pianoFilter = ctx.createBiquadFilter();
     pianoFilter.type = 'lowpass';
     pianoFilter.Q.value = tone.filterQ;
-    const warmRest = Math.max(580 * tone.brightness, Math.min(2400 * tone.brightness, pFreq * tone.warmMul));
+    const pitchWarmBase = Math.max(680 * tone.brightness, Math.min(3800 * tone.brightness, freq * tone.warmMul));
     if (isSoftSwell) {
-      // Gentle dark-to-warm filter bloom with no sudden hammer snap
-      pianoFilter.frequency.setValueAtTime(Math.max(320, warmRest * 0.55), startAt);
-      pianoFilter.frequency.exponentialRampToValueAtTime(warmRest, startAt + 0.9);
+      pianoFilter.frequency.setValueAtTime(Math.max(360, pitchWarmBase * 0.5), startAt);
+      pianoFilter.frequency.exponentialRampToValueAtTime(pitchWarmBase, startAt + 0.9);
     } else {
-      const brightPeak = Math.min(9000, pFreq * (4.2 + velocity * 3.8) * tone.brightness * tone.strike);
-      pianoFilter.frequency.setValueAtTime(brightPeak, startAt);
-      pianoFilter.frequency.exponentialRampToValueAtTime(warmRest, startAt + tone.filterDecay);
+      const brightPeak = Math.min(7800, freq * (3.6 + velocity * 3.8) * tone.brightness * tone.strike);
+      pianoFilter.frequency.setValueAtTime(Math.max(pitchWarmBase + 180, brightPeak), startAt);
+      pianoFilter.frequency.exponentialRampToValueAtTime(pitchWarmBase, startAt + tone.filterDecay);
     }
 
     const pianoEnv = ctx.createGain();
     pianoEnv.gain.value = 0;
+    const decayTime = Math.max(tone.decayMin, tone.decayBase - (midi - 36) * tone.decaySlope);
+
     if (isSoftSwell) {
-      const softPianoTarget = 0.15 * (0.45 + velocity * 0.55);
+      const softPianoTarget = 0.16 * (0.45 + velocity * 0.55);
       pianoEnv.gain.setValueCurveAtTime(
         this.buildRisingCurve(softPianoTarget, 2.2),
         startAt + 0.002,
         Math.max(0.85, swellDuration * 0.65),
       );
     } else {
-      const pianoPeak = tone.peak * (0.45 + velocity * 0.55);
-      const decayTime = Math.max(tone.decayMin, tone.decayBase - (midi - 36) * tone.decaySlope);
+      const pianoPeak = tone.peak * (0.4 + velocity * 0.6);
+      const peakAt = startAt + tone.attack;
+      const bounceAt = peakAt + tone.fastDropTime;
       pianoEnv.gain.setValueAtTime(0.0001, startAt);
-      pianoEnv.gain.linearRampToValueAtTime(pianoPeak, startAt + tone.attack);
-      pianoEnv.gain.exponentialRampToValueAtTime(pianoPeak * tone.decayLevel, startAt + Math.max(decayTime, tone.attack + 0.2));
+      pianoEnv.gain.linearRampToValueAtTime(pianoPeak, peakAt);
+      pianoEnv.gain.exponentialRampToValueAtTime(Math.max(0.001, pianoPeak * tone.fastDropRatio), bounceAt);
+      pianoEnv.gain.setTargetAtTime(0.0004, bounceAt + 0.001, Math.max(0.32, decayTime / 2.8));
+
+      const upperPeak = tone.upperMix * (0.38 + velocity * 0.62);
+      const upperTau = Math.max(0.055, tone.upperDecay * (midi >= 72 ? 0.6 : midi < 54 ? 1.2 : 1.0));
+      upperGain.gain.setValueAtTime(0.0001, startAt);
+      upperGain.gain.linearRampToValueAtTime(upperPeak, peakAt);
+      upperGain.gain.setTargetAtTime(0.0001, peakAt + 0.001, upperTau);
     }
 
-    pianoTri.connect(pianoTriGain);
-    pianoSine.connect(pianoSineGain);
-    pianoHarmonic.connect(pianoHarmGain);
-    pianoTriGain.connect(pianoFilter);
-    pianoSineGain.connect(pianoFilter);
-    pianoHarmGain.connect(pianoFilter);
+    // Grand piano stereo soundboard perspective (bass left, middle center, treble right)
+    const keyPanVal = Math.max(-0.34, Math.min(0.34, ((midi - 60) / 34) * 0.34));
+    const pianoPan = !IS_MOBILE ? ctx.createStereoPanner() : null;
+    if (pianoPan) {
+      pianoPan.pan.value = keyPanVal;
+    }
+
+    stringBody.connect(bodyGain);
+    bodyGain.connect(pianoFilter);
+    if (stringBodyB && bodyBGain) {
+      stringBodyB.connect(bodyBGain);
+      bodyBGain.connect(pianoFilter);
+      nodesToDisconnect.push(bodyBGain);
+    }
+    stringUpper.connect(upperGain);
+    upperGain.connect(pianoFilter);
     pianoFilter.connect(pianoEnv);
-    pianoEnv.connect(channels.feltPiano.input);
+
+    if (pianoPan) {
+      pianoEnv.connect(pianoPan);
+      pianoPan.connect(channels.feltPiano.input);
+      nodesToDisconnect.push(pianoPan);
+    } else {
+      pianoEnv.connect(channels.feltPiano.input);
+    }
 
     const withPiano = !options?.padOnly;
     if (withPiano) {
-      pianoTri.start(startAt);
-      pianoSine.start(startAt);
-      nodesToStop.push(pianoTri, pianoSine);
+      stringBody.start(startAt);
+      stringUpper.start(startAt);
+      nodesToStop.push(stringBody, stringUpper);
+      if (stringBodyB) {
+        stringBodyB.start(startAt);
+        nodesToStop.push(stringBodyB);
+      }
+
+      // Warm wool-felt hammer thump
+      if (!isSoftSwell && this.hammerBuffer && tone.hammerGain > 0) {
+        const hammerSrc = ctx.createBufferSource();
+        hammerSrc.buffer = this.hammerBuffer;
+
+        const hammerFilter = ctx.createBiquadFilter();
+        hammerFilter.type = 'bandpass';
+        hammerFilter.frequency.value = Math.max(380, Math.min(2400, freq * tone.hammerBrightHz));
+        hammerFilter.Q.value = 0.72;
+
+        const hammerGain = ctx.createGain();
+        hammerGain.gain.value = tone.hammerGain * (0.3 + velocity * 0.7) * 0.36;
+
+        hammerSrc.connect(hammerFilter);
+        hammerFilter.connect(hammerGain);
+        hammerGain.connect(pianoPan ?? channels.feltPiano.input);
+
+        hammerSrc.start(startAt);
+        hammerSrc.stop(startAt + 0.055);
+        nodesToStop.push(hammerSrc);
+        nodesToDisconnect.push(hammerFilter, hammerGain);
+      }
     }
-    // On phones the upper partial is skipped unless the tone really depends on it
-    if (withPiano && (!IS_MOBILE || tone.harmGain >= 0.2)) {
-      pianoHarmonic.start(startAt);
-      nodesToStop.push(pianoHarmonic);
-    }
-    nodesToDisconnect.push(pianoTriGain, pianoSineGain, pianoHarmGain, pianoFilter, pianoEnv);
+    nodesToDisconnect.push(bodyGain, upperGain, pianoFilter, pianoEnv);
 
     // Hoisted so piano-only voices can return early with the same cleanup
     const cleanup = () => {
-      nodesToStop.forEach((osc) => {
+      nodesToStop.forEach((node) => {
         try {
-          osc.stop();
-          osc.disconnect();
+          node.stop();
+          node.disconnect();
         } catch {
-          // Ignore already stopped oscillators
+          // Ignore already stopped sources
         }
       });
       nodesToDisconnect.forEach((n) => {
