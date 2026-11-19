@@ -1,3 +1,4 @@
+import { PianoToneParams, getPianoTone } from './pianoTones';
 import {
   ChannelId,
   ChannelState,
@@ -24,6 +25,8 @@ interface ActiveVoice {
   startTime: number;
   released: boolean;
   stopTimeout?: number;
+  pianoOnly?: boolean;
+  padOnly?: boolean;
   // Layer gain envelopes
   pianoEnv: GainNode;
   padEnv: GainNode;
@@ -40,6 +43,10 @@ interface DroneBus {
 export interface VoiceTriggerOptions {
   softSwell?: boolean;
   delayOffsetSec?: number;
+  // Piano layer only (used by the background player): cheaper, no pad/shimmer/sub layers
+  pianoOnly?: boolean;
+  // Pad layer only (used by the background player underneath the piano)
+  padOnly?: boolean;
 }
 
 const IS_MOBILE =
@@ -51,12 +58,19 @@ const MAX_POLY_VOICES = IS_MOBILE ? 5 : 18;
 const MAX_REVERB_SEC = IS_MOBILE ? 1.8 : 10;
 // Phones run the whole engine at half sample-rate (about half the CPU work).
 const MOBILE_SAMPLE_RATE = 24000;
+// Piano-only voices (background player) are about a third of the cost of a full voice.
+const MAX_PIANO_ONLY_VOICES = IS_MOBILE ? 10 : 24;
+const MAX_PAD_ONLY_VOICES = IS_MOBILE ? 6 : 12;
 // The convolution reverb is the heaviest single node. Off on phones; echo tail is used instead.
 // Set to true to bring it back on phones.
 const MOBILE_CONVOLVER = false;
 const USE_CONVOLVER = !IS_MOBILE || MOBILE_CONVOLVER;
 const DRONE_CROSSFADE_SEC = 4.0;
 const SCENE_MORPH_SEC = 1.5;
+
+type VoiceKind = 'full' | 'piano' | 'pad';
+const kindOf = (v: { pianoOnly?: boolean; padOnly?: boolean }): VoiceKind =>
+  v.pianoOnly ? 'piano' : v.padOnly ? 'pad' : 'full';
 
 export class WorshipAudioEngine {
   private ctx: AudioContext | null = null;
@@ -74,6 +88,8 @@ export class WorshipAudioEngine {
   private wetGain: GainNode | null = null;
   private reverbSend: GainNode | null = null;
   private convolver: ConvolverNode | null = null;
+  private pianoTone: PianoToneParams = getPianoTone('felt').params;
+  private panicListeners = new Set<() => void>();
   private shimmerDelayL: DelayNode | null = null;
   private shimmerDelayR: DelayNode | null = null;
   private shimmerFeedbackL: GainNode | null = null;
@@ -99,6 +115,17 @@ export class WorshipAudioEngine {
 
   // Listeners
   private onStateChange?: () => void;
+
+  public setPianoTone(id: string) {
+    this.pianoTone = getPianoTone(id).params;
+  }
+
+  public addPanicListener(cb: () => void): () => void {
+    this.panicListeners.add(cb);
+    return () => {
+      this.panicListeners.delete(cb);
+    };
+  }
 
   public setOnStateChange(cb: () => void) {
     this.onStateChange = cb;
@@ -535,21 +562,27 @@ export class WorshipAudioEngine {
     this.sustainedNotes.delete(midi);
 
     // Release any existing sounding voice of the same pitch gently to prevent buildup
+    const wantKind: VoiceKind = options?.pianoOnly ? 'piano' : options?.padOnly ? 'pad' : 'full';
     const existing = this.activeVoices.get(midi);
     if (existing && existing.length > 0) {
       existing.forEach((v) => {
-        if (!v.released) {
+        if (!v.released && kindOf(v) === wantKind) {
           this.releaseVoice(v, options?.softSwell ? 0.35 : 0.08);
         }
       });
     }
 
-    // Voice stealing if polyphony exceeds cap
-    const allVoices: ActiveVoice[] = [];
-    this.activeVoices.forEach((list) => allVoices.push(...list));
-    if (allVoices.length >= MAX_POLY_VOICES) {
-      allVoices.sort((a, b) => a.startTime - b.startTime);
-      const oldest = allVoices[0];
+    // Voice stealing if polyphony exceeds the cap (full voices and piano-only voices are counted separately)
+    const pool: ActiveVoice[] = [];
+    this.activeVoices.forEach((list) => {
+      list.forEach((v) => {
+        if (kindOf(v) === wantKind) pool.push(v);
+      });
+    });
+    const cap =
+      wantKind === 'piano' ? MAX_PIANO_ONLY_VOICES : wantKind === 'pad' ? MAX_PAD_ONLY_VOICES : MAX_POLY_VOICES;
+    if (pool.length >= cap) {
+      const oldest = pool.filter((v) => !v.released).sort((a, b) => a.startTime - b.startTime)[0];
       if (oldest) {
         this.releaseVoice(oldest, 0.04);
       }
@@ -573,7 +606,21 @@ export class WorshipAudioEngine {
     const list = this.activeVoices.get(midi);
     if (list) {
       list.forEach((v) => {
-        if (!v.released) {
+        if (!v.released && kindOf(v) === 'full') {
+          this.releaseVoice(v);
+        }
+      });
+    }
+    this.onStateChange?.();
+  }
+
+  // Used by the background player: releases only that player's piano or pad voices for a pitch
+  public releaseNote(midi: number, kind: 'piano' | 'pad') {
+    this.heldKeys.delete(midi);
+    const list = this.activeVoices.get(midi);
+    if (list) {
+      list.forEach((v) => {
+        if (!v.released && kindOf(v) === kind) {
           this.releaseVoice(v);
         }
       });
@@ -587,7 +634,7 @@ export class WorshipAudioEngine {
     const list = this.activeVoices.get(midi);
     if (list) {
       list.forEach((v) => {
-        if (!v.released) {
+        if (!v.released && kindOf(v) === 'full') {
           this.releaseVoice(v);
         }
       });
@@ -605,7 +652,7 @@ export class WorshipAudioEngine {
           const list = this.activeVoices.get(midi);
           if (list) {
             list.forEach((v) => {
-              if (!v.released) this.releaseVoice(v);
+              if (!v.released && kindOf(v) === 'full') this.releaseVoice(v);
             });
           }
         }
@@ -615,6 +662,7 @@ export class WorshipAudioEngine {
   }
 
   public panic() {
+    this.panicListeners.forEach((cb) => cb());
     this.heldKeys.clear();
     this.sustainedNotes.clear();
     this.sustainActive = false;
@@ -674,37 +722,40 @@ export class WorshipAudioEngine {
     // LAYER 1: FELT ACOUSTIC PIANO
     // Triangle + Sine oscillators with short pluck filter envelope & warm roll-off
     // =========================================================================
+    const tone = this.pianoTone;
+    const pFreq = freq * Math.pow(2, tone.pitchShift / 12);
+
     const pianoTri = ctx.createOscillator();
-    pianoTri.type = 'triangle';
-    pianoTri.frequency.value = freq;
+    pianoTri.type = tone.triType;
+    pianoTri.frequency.value = pFreq;
 
     const pianoSine = ctx.createOscillator();
     pianoSine.type = 'sine';
-    pianoSine.frequency.value = freq;
+    pianoSine.frequency.value = pFreq;
 
     const pianoHarmonic = ctx.createOscillator();
     pianoHarmonic.type = 'sine';
-    pianoHarmonic.frequency.value = freq * 2;
+    pianoHarmonic.frequency.value = pFreq * tone.harmMult;
 
     const pianoTriGain = ctx.createGain();
-    pianoTriGain.gain.value = 0.52;
+    pianoTriGain.gain.value = tone.triGain;
     const pianoSineGain = ctx.createGain();
-    pianoSineGain.gain.value = 0.36;
+    pianoSineGain.gain.value = tone.sineGain;
     const pianoHarmGain = ctx.createGain();
-    pianoHarmGain.gain.value = (isSoftSwell ? 0.045 : 0.11) * velocity;
+    pianoHarmGain.gain.value = (isSoftSwell ? tone.harmGain * 0.4 : tone.harmGain) * velocity;
 
     const pianoFilter = ctx.createBiquadFilter();
     pianoFilter.type = 'lowpass';
-    pianoFilter.Q.value = 0.65;
-    const warmRest = Math.max(580, Math.min(2400, freq * 2.2));
+    pianoFilter.Q.value = tone.filterQ;
+    const warmRest = Math.max(580 * tone.brightness, Math.min(2400 * tone.brightness, pFreq * tone.warmMul));
     if (isSoftSwell) {
       // Gentle dark-to-warm filter bloom with no sudden hammer snap
       pianoFilter.frequency.setValueAtTime(Math.max(320, warmRest * 0.55), startAt);
       pianoFilter.frequency.exponentialRampToValueAtTime(warmRest, startAt + 0.9);
     } else {
-      const brightPeak = Math.min(9000, freq * (4.2 + velocity * 3.8));
+      const brightPeak = Math.min(9000, pFreq * (4.2 + velocity * 3.8) * tone.brightness * tone.strike);
       pianoFilter.frequency.setValueAtTime(brightPeak, startAt);
-      pianoFilter.frequency.exponentialRampToValueAtTime(warmRest, startAt + 0.19);
+      pianoFilter.frequency.exponentialRampToValueAtTime(warmRest, startAt + tone.filterDecay);
     }
 
     const pianoEnv = ctx.createGain();
@@ -717,11 +768,11 @@ export class WorshipAudioEngine {
         Math.max(0.85, swellDuration * 0.65),
       );
     } else {
-      const pianoPeak = 0.34 * (0.45 + velocity * 0.55);
-      const decayTime = Math.max(1.8, 4.6 - (midi - 36) * 0.045);
+      const pianoPeak = tone.peak * (0.45 + velocity * 0.55);
+      const decayTime = Math.max(tone.decayMin, tone.decayBase - (midi - 36) * tone.decaySlope);
       pianoEnv.gain.setValueAtTime(0.0001, startAt);
-      pianoEnv.gain.linearRampToValueAtTime(pianoPeak, startAt + 0.01);
-      pianoEnv.gain.exponentialRampToValueAtTime(pianoPeak * 0.18, startAt + decayTime);
+      pianoEnv.gain.linearRampToValueAtTime(pianoPeak, startAt + tone.attack);
+      pianoEnv.gain.exponentialRampToValueAtTime(pianoPeak * tone.decayLevel, startAt + Math.max(decayTime, tone.attack + 0.2));
     }
 
     pianoTri.connect(pianoTriGain);
@@ -733,14 +784,64 @@ export class WorshipAudioEngine {
     pianoFilter.connect(pianoEnv);
     pianoEnv.connect(channels.feltPiano.input);
 
-    pianoTri.start(startAt);
-    pianoSine.start(startAt);
-    nodesToStop.push(pianoTri, pianoSine);
-    if (!IS_MOBILE) {
+    const withPiano = !options?.padOnly;
+    if (withPiano) {
+      pianoTri.start(startAt);
+      pianoSine.start(startAt);
+      nodesToStop.push(pianoTri, pianoSine);
+    }
+    // On phones the upper partial is skipped unless the tone really depends on it
+    if (withPiano && (!IS_MOBILE || tone.harmGain >= 0.2)) {
       pianoHarmonic.start(startAt);
       nodesToStop.push(pianoHarmonic);
     }
     nodesToDisconnect.push(pianoTriGain, pianoSineGain, pianoHarmGain, pianoFilter, pianoEnv);
+
+    // Hoisted so piano-only voices can return early with the same cleanup
+    const cleanup = () => {
+      nodesToStop.forEach((osc) => {
+        try {
+          osc.stop();
+          osc.disconnect();
+        } catch {
+          // Ignore already stopped oscillators
+        }
+      });
+      nodesToDisconnect.forEach((n) => {
+        try {
+          n.disconnect();
+        } catch {
+          // Ignore
+        }
+      });
+
+      const list = this.activeVoices.get(midi);
+      if (list) {
+        const filtered = list.filter((v) => v.id !== id);
+        if (filtered.length === 0) {
+          this.activeVoices.delete(midi);
+        } else {
+          this.activeVoices.set(midi, filtered);
+        }
+      }
+    };
+
+    if (options?.pianoOnly) {
+      // Background player voice: piano layer only. Idle gains stand in for the unused layers.
+      const idle = ctx.createGain();
+      return {
+        id,
+        midi,
+        startTime: startAt,
+        released: false,
+        pianoOnly: true,
+        pianoEnv,
+        padEnv: idle,
+        shimmerEnv: idle,
+        subEnv: idle,
+        cleanup,
+      };
+    }
 
     // =========================================================================
     // LAYER 2: WARM ANALOG PAD
@@ -812,6 +913,23 @@ export class WorshipAudioEngine {
     nodesToStop.push(padSawL, padTri);
     if (!IS_MOBILE) nodesToStop.push(padSawR);
     nodesToDisconnect.push(panL, panR, padSawGain, padTriGain, padFilter, padEnv);
+
+    if (options?.padOnly && IS_MOBILE) {
+      // Phones: a background pad is just the warm pad layer (no shimmer or sub), to save CPU
+      const idle = ctx.createGain();
+      return {
+        id,
+        midi,
+        startTime: startAt,
+        released: false,
+        padOnly: true,
+        pianoEnv,
+        padEnv,
+        shimmerEnv: idle,
+        subEnv: idle,
+        cleanup,
+      };
+    }
 
     // =========================================================================
     // LAYER 3: HIGH SHIMMER LAYER
@@ -902,39 +1020,13 @@ export class WorshipAudioEngine {
     nodesToStop.push(subOsc);
     nodesToDisconnect.push(subEnv);
 
-    const cleanup = () => {
-      nodesToStop.forEach((osc) => {
-        try {
-          osc.stop();
-          osc.disconnect();
-        } catch {
-          // Ignore already stopped oscillators
-        }
-      });
-      nodesToDisconnect.forEach((n) => {
-        try {
-          n.disconnect();
-        } catch {
-          // Ignore
-        }
-      });
-
-      const list = this.activeVoices.get(midi);
-      if (list) {
-        const filtered = list.filter((v) => v.id !== id);
-        if (filtered.length === 0) {
-          this.activeVoices.delete(midi);
-        } else {
-          this.activeVoices.set(midi, filtered);
-        }
-      }
-    };
-
     return {
       id,
       midi,
       startTime: startAt,
       released: false,
+      pianoOnly: false,
+      padOnly: Boolean(options?.padOnly),
       pianoEnv,
       padEnv,
       shimmerEnv,
@@ -948,10 +1040,11 @@ export class WorshipAudioEngine {
     voice.released = true;
     const now = this.ctx.currentTime;
 
-    const pianoRel = overrideReleaseSec ?? 0.38;
-    const padRel = overrideReleaseSec ?? this.shaping.padRelease;
-    const shimmerRel = overrideReleaseSec ?? Math.max(1.8, this.shaping.padRelease * 1.15);
-    const subRel = overrideReleaseSec ?? 0.45;
+    const pianoRel = overrideReleaseSec ?? this.pianoTone.release;
+    const padRel = overrideReleaseSec ?? (voice.pianoOnly ? pianoRel : this.shaping.padRelease);
+    const shimmerRel =
+      overrideReleaseSec ?? (voice.pianoOnly ? pianoRel : Math.max(1.8, this.shaping.padRelease * 1.15));
+    const subRel = overrideReleaseSec ?? (voice.pianoOnly ? pianoRel : 0.45);
     const maxRel = Math.max(pianoRel, padRel, shimmerRel, subRel);
 
     const rampOut = (gainNode: GainNode, duration: number) => {

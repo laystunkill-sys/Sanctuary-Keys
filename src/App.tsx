@@ -5,6 +5,7 @@ import { DronePadGrid } from './components/DronePadGrid';
 import { KeyboardDeck } from './components/KeyboardDeck';
 import { LayerMixer } from './components/LayerMixer';
 import { PerformanceControls } from './components/PerformanceControls';
+import { BackgroundMusicPanel } from './components/BackgroundMusicPanel';
 import { SceneMorphBar } from './components/SceneMorphBar';
 import { SET_LIST_STORAGE_KEY, SetListBar, SetListSong, loadSetList } from './components/SetListBar';
 import { TopBar } from './components/TopBar';
@@ -720,7 +721,7 @@ export default function App() {
   }, [engine]);
 
   return (
-    <div className="min-h-dvh lg:h-dvh lg:overflow-hidden flex flex-col bg-[#0f172a] text-slate-100">
+    <div className="min-h-dvh flex flex-col bg-[#0f172a] text-slate-100">
       <TopBar
         audioRunning={audioRunning}
         onStartAudio={handleStartAudio}
@@ -763,7 +764,7 @@ export default function App() {
       )}
 
       {/* Main Single-Screen Performance Console */}
-      <main className="flex-1 min-h-0 flex flex-col gap-2.5 lg:gap-3 p-2.5 lg:p-3.5 max-w-[1600px] w-full mx-auto">
+      <main className="flex-1 flex flex-col gap-2.5 lg:gap-3 p-2.5 lg:p-3.5 max-w-[1600px] w-full mx-auto">
         {/* Set List: recall scene + key + drone + chords for the next song in one tap */}
         <SetListBar
           songs={setList}
@@ -778,6 +779,9 @@ export default function App() {
           onMoveSong={handleMoveSong}
           onDeleteSong={handleDeleteSong}
         />
+
+        {/* Background Music: looping chord progression on piano, in the chosen key */}
+        <BackgroundMusicPanel engine={engine} droneKey={droneKey} />
 
         {/* Upper Deck: Scene Morph Presets + 12-Key Drone Grid */}
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-2.5 lg:gap-3 shrink-0">
@@ -807,7 +811,7 @@ export default function App() {
         </div>
 
         {/* Middle Deck: 5-Channel Mixer + Performance Shaping */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-2.5 lg:gap-3 flex-1 min-h-0">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-2.5 lg:gap-3 flex-1 lg:min-h-[24rem]">
           <div className="lg:col-span-7 min-h-0">
             <LayerMixer
               channels={channels}
